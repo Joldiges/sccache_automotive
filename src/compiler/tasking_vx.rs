@@ -429,6 +429,11 @@ fn argument_may_consume_value(argument: &str) -> bool {
         return false;
     }
 
+    // An inline value, including an empty one, cannot consume the next argument.
+    if argument.contains('=') {
+        return false;
+    }
+
     for info in ARGS.iter() {
         match info {
             ArgInfo::Flag(flag, _) if argument == *flag => return false,
@@ -1045,6 +1050,35 @@ mod test {
         };
 
         assert_eq!(ovec!["-Iinclude", "-DFOO=1"], preprocessor_args);
+    }
+
+    #[test]
+    fn test_option_file_after_unknown_inline_option_is_expanded() {
+        for inline_option in ["--unknown=value", "--unknown="] {
+            let fixture = TestFixture::new();
+            fs::write(fixture.tempdir.path().join("options"), "-DFOO=1").unwrap();
+
+            let ParsedArguments {
+                preprocessor_args,
+                common_args,
+                ..
+            } = match parse_arguments_in(
+                vec![
+                    inline_option.into(),
+                    "-f".into(),
+                    "options".into(),
+                    "-c".into(),
+                    "foo.c".into(),
+                ],
+                fixture.tempdir.path(),
+            ) {
+                CompilerArguments::Ok(args) => args,
+                other => panic!("Got unexpected parse result: {other:?}"),
+            };
+
+            assert_eq!(ovec!["-DFOO=1"], preprocessor_args);
+            assert_eq!(vec![OsString::from(inline_option)], common_args);
+        }
     }
 
     #[test]

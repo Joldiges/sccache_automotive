@@ -20,6 +20,9 @@ sccache is also available as a [GitHub Actions](https://github.com/marketplace/a
 
 ---
 
+Automotive fork maintenance and private-package release guidance is documented
+in [docs/Automotive.md](docs/Automotive.md).
+
 Table of Contents (ToC)
 =======================
 

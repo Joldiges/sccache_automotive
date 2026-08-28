@@ -23,6 +23,12 @@ server_startup_timeout_ms = 10000
 # Example:
 #   basedir = ["/home/user/project"] results in the path prefix rewrite:
 #   "/home/user/project/src/main.c" -> "src/main.c"
+#
+# This only normalizes cache keys. Use compiler path-remapping options when
+# absolute paths can be embedded in __FILE__, debug information, coverage
+# data, or other outputs. For GCC and Clang, the source paths in
+# -fdebug-prefix-map, -ffile-prefix-map, and -fmacro-prefix-map are normalized
+# against this list as well.
 basedirs = ["/home/user/project"]
 # basedirs = ["/home/user/project", "/home/user/workspace"]
 

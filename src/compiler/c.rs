@@ -741,7 +741,7 @@ fn process_preprocessed_file(
             // GCC precompiled header:
             || slice[1..].starts_with(PRAGMA_GCC_PCH_PREPROCESS)
             // HP/AIX:
-            || (&slice[1..5] == b"line "))
+            || slice[1..].starts_with(b"line "))
         && (start == 0 || bytes[start - 1] == b'\n')
         {
             match process_preprocessor_line(
@@ -1441,7 +1441,38 @@ impl pkg::ToolchainPackager for CToolchainPackager {
 }
 
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
-pub const CACHE_VERSION: &[u8] = b"12";
+pub const CACHE_VERSION: &[u8] = b"13";
+
+const PREFIX_MAP_FLAGS: [&[u8]; 3] = [
+    b"-fdebug-prefix-map=",
+    b"-ffile-prefix-map=",
+    b"-fmacro-prefix-map=",
+];
+
+fn normalize_prefix_map_argument(arg: &OsStr, basedirs: &[Vec<u8>]) -> Option<Vec<u8>> {
+    let bytes = arg.as_encoded_bytes();
+    let prefix = PREFIX_MAP_FLAGS
+        .iter()
+        .find(|prefix| bytes.starts_with(prefix))?;
+    let mapping = &bytes[prefix.len()..];
+    let separator = mapping.iter().position(|byte| *byte == b'=')?;
+    let source = &mapping[..separator];
+
+    #[cfg(target_os = "windows")]
+    let source = Cow::Owned(crate::util::normalize_win_path(source));
+    #[cfg(not(target_os = "windows"))]
+    let source = Cow::Borrowed(source);
+    let source: &[u8] = &source;
+
+    basedirs
+        .iter()
+        .find(|basedir| source == basedir.strip_suffix(b"/").unwrap_or(basedir))?;
+
+    let mut normalized = Vec::with_capacity(bytes.len());
+    normalized.extend_from_slice(prefix);
+    normalized.extend_from_slice(&mapping[separator..]);
+    Some(normalized)
+}
 
 /// Environment variables that are factored into the cache key.
 static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
@@ -1561,7 +1592,13 @@ impl<'a> HashKeyParams<'a> {
         m.update(CACHE_VERSION);
         m.update(self.language.as_str().as_bytes());
         for arg in self.arguments {
-            arg.hash(&mut HashToDigest { digest: &mut m });
+            if let Some(normalized) = normalize_prefix_map_argument(arg, self.basedirs) {
+                m.update(b"\x01");
+                normalized.hash(&mut HashToDigest { digest: &mut m });
+            } else {
+                m.update(b"\x00");
+                arg.hash(&mut HashToDigest { digest: &mut m });
+            }
         }
         for hash in self.extra_hashes {
             m.update(hash.as_bytes());
@@ -1756,6 +1793,95 @@ mod test {
         assert_eq!(h1, hash_with_basedirs(preprocessed1, &multi_basedirs));
     }
 
+    #[test]
+    fn test_hash_key_basedirs_normalizes_prefix_map_source() {
+        let basedirs1 = [b"/build/dir1/".to_vec()];
+        let basedirs2 = [b"/build/dir2/".to_vec()];
+
+        for flag in PREFIX_MAP_FLAGS {
+            let flag = std::str::from_utf8(flag).unwrap();
+            let args1 = vec![OsString::from(format!("{flag}/build/dir1=/workspace"))];
+            let args2 = vec![OsString::from(format!("{flag}/build/dir2=/workspace"))];
+
+            let h1 = HashKeyParams::new("abcd", Language::C, &args1, b"hello world")
+                .with_basedirs(&basedirs1)
+                .compute();
+            let h2 = HashKeyParams::new("abcd", Language::C, &args2, b"hello world")
+                .with_basedirs(&basedirs2)
+                .compute();
+            assert_eq!(h1, h2);
+
+            let h1_without_basedirs =
+                HashKeyParams::new("abcd", Language::C, &args1, b"hello world").compute();
+            let h2_without_basedirs =
+                HashKeyParams::new("abcd", Language::C, &args2, b"hello world").compute();
+            assert_neq!(h1_without_basedirs, h2_without_basedirs);
+        }
+    }
+
+    #[test]
+    fn test_hash_key_basedirs_prefix_map_destination_still_matters() {
+        let args1 = ovec!["-ffile-prefix-map=/build/dir1=/workspace"];
+        let args2 = ovec!["-ffile-prefix-map=/build/dir2=/other"];
+        let basedirs1 = [b"/build/dir1/".to_vec()];
+        let basedirs2 = [b"/build/dir2/".to_vec()];
+
+        let h1 = HashKeyParams::new("abcd", Language::C, &args1, b"hello world")
+            .with_basedirs(&basedirs1)
+            .compute();
+        let h2 = HashKeyParams::new("abcd", Language::C, &args2, b"hello world")
+            .with_basedirs(&basedirs2)
+            .compute();
+        assert_neq!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_key_basedirs_does_not_normalize_other_arguments() {
+        let args1 = ovec!["-DPROJECT_ROOT=/build/dir1"];
+        let args2 = ovec!["-DPROJECT_ROOT=/build/dir2"];
+        let basedirs1 = [b"/build/dir1/".to_vec()];
+        let basedirs2 = [b"/build/dir2/".to_vec()];
+
+        let h1 = HashKeyParams::new("abcd", Language::C, &args1, b"hello world")
+            .with_basedirs(&basedirs1)
+            .compute();
+        let h2 = HashKeyParams::new("abcd", Language::C, &args2, b"hello world")
+            .with_basedirs(&basedirs2)
+            .compute();
+        assert_neq!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_key_basedirs_prefix_map_normalization_is_domain_separated() {
+        let normalized_args = ovec!["-ffile-prefix-map=/build/dir1=/workspace"];
+        let literal_args = ovec!["-ffile-prefix-map==/workspace"];
+        let basedirs = [b"/build/dir1/".to_vec()];
+
+        let normalized = HashKeyParams::new("abcd", Language::C, &normalized_args, b"hello world")
+            .with_basedirs(&basedirs)
+            .compute();
+        let literal = HashKeyParams::new("abcd", Language::C, &literal_args, b"hello world")
+            .with_basedirs(&basedirs)
+            .compute();
+        assert_neq!(normalized, literal);
+    }
+
+    #[test]
+    fn test_hash_key_basedirs_does_not_normalize_prefix_map_subdirectories() {
+        let args1 = ovec!["-ffile-prefix-map=/build/dir1/src=/workspace"];
+        let args2 = ovec!["-ffile-prefix-map=/build/dir2/src=/workspace"];
+        let basedirs1 = [b"/build/dir1/".to_vec()];
+        let basedirs2 = [b"/build/dir2/".to_vec()];
+
+        let h1 = HashKeyParams::new("abcd", Language::C, &args1, b"hello world")
+            .with_basedirs(&basedirs1)
+            .compute();
+        let h2 = HashKeyParams::new("abcd", Language::C, &args2, b"hello world")
+            .with_basedirs(&basedirs2)
+            .compute();
+        assert_neq!(h1, h2);
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn test_hash_key_basedirs_windows_escaped_backslashes() {
@@ -1903,6 +2029,56 @@ mod test {
         assert_eq!(&bytes, &original_bytes);
         assert!(success);
         assert_eq!(include_files.len(), 0);
+    }
+
+    #[test]
+    fn test_process_preprocessed_file_line_directive() {
+        let header = PathBuf::from("tests/test.h");
+        let fs_impl = TestFs {
+            metadata_results: Mutex::new(
+                [(
+                    header.clone(),
+                    PreprocessorFileMetadata {
+                        is_dir: false,
+                        is_file: true,
+                        modified: Some(Timestamp::new(12341234, 0)),
+                        ctime_or_creation: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            open_results: Mutex::new(
+                [(
+                    header.clone(),
+                    Box::new(&b"contents"[..]) as Box<dyn std::io::Read>,
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        };
+        let mut bytes = br#"#line 1 "tests/test.h"
+int value;
+"#
+        .to_vec();
+        let mut include_files = HashMap::new();
+
+        let success = process_preprocessed_file(
+            Path::new("tests/test.c"),
+            Path::new(""),
+            &mut bytes,
+            &mut include_files,
+            PreprocessorCacheModeConfig::activated(),
+            std::time::SystemTime::now(),
+            fs_impl,
+        )
+        .unwrap();
+
+        assert!(success);
+        assert_eq!(
+            include_files.get(&header).map(String::as_str),
+            Some("a93900c371d997927c5bc568ea538bed59ae5c960021dcfe7b0b369da5267528")
+        );
     }
 
     /// A filesystem interface that only panics to test that we don't access it.

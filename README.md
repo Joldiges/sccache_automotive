@@ -20,6 +20,9 @@ sccache is also available as a [GitHub Actions](https://github.com/marketplace/a
 
 ---
 
+Automotive fork maintenance and private-package release guidance is documented
+in [docs/Automotive.md](docs/Automotive.md).
+
 Table of Contents (ToC)
 =======================
 
@@ -351,6 +354,13 @@ This is similar to ccache's `CCACHE_BASEDIR` and helps when:
 * Working with multiple project checkouts simultaneously
 
 **Note:** Only absolute paths are supported. Relative paths will prevent server from starting.
+
+`SCCACHE_BASEDIRS` only normalizes cache keys; it does not rewrite paths in compiler
+outputs. If paths can appear in `__FILE__`, debug information, coverage data, or
+other artifacts, use the compiler's path-remapping options as well. For GCC and
+Clang, sccache normalizes the source path in `-fdebug-prefix-map`,
+`-ffile-prefix-map`, and `-fmacro-prefix-map` arguments so each checkout can map
+its own absolute root to the same destination without preventing a cache hit.
 
 You can also configure this in the sccache config file:
 

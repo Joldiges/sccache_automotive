@@ -1,0 +1,59 @@
+name: Prefix.dev packages
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-64
+          - os: windows-2022
+            target: win-64
+          - os: macos-15-intel
+            target: osx-64
+          - os: macos-14
+            target: osx-arm64
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v5
+
+      - name: Build conda package
+        uses: prefix-dev/rattler-build-action@v0.2.39
+        with:
+          recipe-path: conda.recipe/recipe.yaml
+          artifact-name: sccache-${{ matrix.target }}
+          build-args: --experimental --target-platform=${{ matrix.target }} -c conda-forge
+
+      - name: Upload package to Prefix.dev
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          PREFIX_CHANNEL: "@jamesoldiges/bobs-forge"
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r -d '' package; do
+            found=1
+            rattler-build upload prefix \
+              --skip-existing \
+              --channel "$PREFIX_CHANNEL" \
+              "$package"
+          done < <(find output -type f \( -name '*.conda' -o -name '*.tar.bz2' \) -print0)
+          if [[ "$found" -eq 0 ]]; then
+            echo "No conda packages were produced"
+            exit 1
+          fi

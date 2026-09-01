@@ -68,9 +68,12 @@ publishes on pushes to `main`, version tags, and manual workflow dispatches.
 After a package is published, it can be installed with:
 
 ```sh
-pixi global install sccache --channel https://prefix.dev/channels/@jamesoldiges/bobs-forge
-conda install -c https://prefix.dev/channels/@jamesoldiges/bobs-forge sccache
+pixi global install sccache-automotive --channel https://prefix.dev/channels/@jamesoldiges/bobs-forge
+conda install -c https://prefix.dev/channels/@jamesoldiges/bobs-forge sccache-automotive
 ```
+
+The package installs the `sccache` executable without replacing the upstream
+`sccache` package name.
 
 ## Upstreaming
 

@@ -1,0 +1,35 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/prefix-dev/recipe-format/main/schema.json
+
+context:
+  name: sccache-automotive
+  version: ${{ load_from_file("../Cargo.toml").package.version }}
+
+package:
+  name: ${{ name }}
+  version: ${{ version }}
+
+source:
+  path: ..
+
+build:
+  number: 0
+  script: build
+
+requirements:
+  build:
+    - ${{ compiler("rust") }}
+    - cargo-bundle-licenses
+
+tests:
+  - script:
+      - sccache --version
+
+about:
+  homepage: https://github.com/Joldiges/sccache_automotive
+  repository: https://github.com/Joldiges/sccache_automotive
+  summary: A ccache-like tool for caching compiler output
+  description: ${{ load_from_file("../Cargo.toml").package.description }}
+  license: Apache-2.0
+  license_file:
+    - LICENSE
+    - THIRDPARTY.yml

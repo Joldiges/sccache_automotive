@@ -51,6 +51,30 @@ Do not claim a platform is supported merely because the recipe renders. A
 platform is supported only after its native package has been built, installed,
 and exercised with the relevant compiler workflow.
 
+## Prefix.dev packages
+
+The repository workflow at `.github/workflows/prefix.yml` builds native
+`linux-64`, `win-64`, `osx-64`, and `osx-arm64` packages and publishes them to
+the `@jamesoldiges/bobs-forge` channel. To enable its trusted publisher, enter
+the following values in the channel's repository-access settings:
+
+- GitHub owner: `Joldiges`
+- Repository: `sccache_automotive`
+- Workflow file: `prefix.yml`
+- Environment: leave blank
+
+The workflow uses GitHub OIDC, so it does not need a repository secret. It
+publishes on pushes to `main`, version tags, and manual workflow dispatches.
+After a package is published, it can be installed with:
+
+```sh
+pixi global install sccache-automotive --channel https://prefix.dev/channels/@jamesoldiges/bobs-forge
+conda install -c https://prefix.dev/channels/@jamesoldiges/bobs-forge sccache-automotive
+```
+
+The package installs the `sccache` executable without replacing the upstream
+`sccache` package name.
+
 ## Upstreaming
 
 Keep independent root causes on independent branches. PR descriptions should be

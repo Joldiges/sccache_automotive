@@ -30,6 +30,7 @@ jobs:
       - name: Build conda package
         uses: prefix-dev/rattler-build-action@v0.2.39
         with:
+          rattler-build-version: v0.74.0
           recipe-path: conda.recipe/recipe.yaml
           artifact-name: sccache-${{ matrix.target }}
           build-args: --experimental --target-platform=${{ matrix.target }} -c conda-forge

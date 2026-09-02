@@ -63,6 +63,9 @@ the following values in the channel's repository-access settings:
 - Workflow file: `prefix.yml`
 - Environment: leave blank
 
+The workflow pins rattler-build v0.74.0, which preserves the namespace in the
+channel name during upload.
+
 The workflow uses GitHub OIDC, so it does not need a repository secret. It
 publishes on pushes to `main`, version tags, and manual workflow dispatches.
 After a package is published, it can be installed with:

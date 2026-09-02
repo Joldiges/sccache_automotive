@@ -19,7 +19,7 @@ concurrency:
 jobs:
   benchmarks:
     name: Run ${{ matrix.mode }} benchmarks (CodSpeed)
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     strategy:
       matrix:
         mode:

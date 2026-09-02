@@ -55,8 +55,9 @@ and exercised with the relevant compiler workflow.
 
 The repository workflow at `.github/workflows/prefix.yml` builds native
 `linux-64`, `win-64`, `osx-64`, and `osx-arm64` packages and publishes them to
-the `@jamesoldiges/bobs-forge` channel. To enable its trusted publisher, enter
-the following values in the channel's repository-access settings:
+the `jamesoldiges/bobs-forge` channel (shown as
+`@jamesoldiges/bobs-forge` in Prefix.dev). To enable its trusted publisher,
+enter the following values in the channel's repository-access settings:
 
 - GitHub owner: `Joldiges`
 - Repository: `sccache_automotive`

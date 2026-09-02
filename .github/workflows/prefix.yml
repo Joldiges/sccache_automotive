@@ -39,7 +39,7 @@ jobs:
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         shell: bash
         env:
-          PREFIX_CHANNEL: "@jamesoldiges/bobs-forge"
+          PREFIX_CHANNEL: "jamesoldiges/bobs-forge"
         run: |
           set -euo pipefail
           found=0

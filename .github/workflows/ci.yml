@@ -9,12 +9,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, windows-latest ]
+        os: [ self-hosted, windows-latest ]
         component: [ clippy ]
         include:
           - component: rustfmt
             cargo_cmd: fmt -- --check
-            os: ubuntu-latest
+            os: self-hosted
           - component: clippy
             cargo_cmd: clippy --locked --all-targets -- -D warnings -A unknown-lints -A clippy::type_complexity -A clippy::new-without-default
     steps:
@@ -36,7 +36,7 @@ jobs:
         run: cargo ${{ matrix.cargo_cmd }}
 
   check_features:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     strategy:
       matrix:
         feature: [ azure, gcs, gha, memcached, redis, s3, webdav ]
@@ -48,7 +48,7 @@ jobs:
         run: cargo check --no-default-features --features ${{ matrix.feature }}
 
   toml_format:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: Clone repository
         uses: actions/checkout@v5

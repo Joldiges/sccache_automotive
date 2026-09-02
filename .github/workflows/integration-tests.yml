@@ -14,7 +14,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: self-hosted
     steps:
       - name: Clone repository
         uses: actions/checkout@v5
@@ -34,7 +34,7 @@ jobs:
           path: ./target/debug/sccache
 
   integration-tests:
-    runs-on: ubuntu-24.04
+    runs-on: self-hosted
     strategy:
       matrix:
         type: [backends, tools]
@@ -66,7 +66,7 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   gha:
-    runs-on: ubuntu-24.04
+    runs-on: self-hosted
     needs: build
 
     env:
@@ -203,7 +203,7 @@ jobs:
   hip:
     # Probably wouldn't matter anyway since we run in a container, but staying
     # close to the version is better than not.
-    runs-on: ubuntu-24.04
+    runs-on: self-hosted
     needs: build
     container:
       image: rocm/dev-ubuntu-24.04:6.3

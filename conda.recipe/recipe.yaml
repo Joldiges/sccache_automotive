@@ -12,7 +12,8 @@ source:
   path: ..
 
 build:
-  number: 0
+  number: ${{ env.get("GIT_BUILD_NUMBER", default="0") }}
+  string: ${{ env.get("GIT_BUILD_STRING", default="local") }}
   script: build
 
 requirements:

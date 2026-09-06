@@ -69,6 +69,8 @@ channel name during upload.
 
 The workflow uses GitHub OIDC, so it does not need a repository secret. It
 publishes on pushes to `main`, version tags, and manual workflow dispatches.
+Each package build string includes the short source commit ID, so commits with
+the same Cargo version publish distinct artifacts.
 After a package is published, it can be installed with:
 
 ```sh

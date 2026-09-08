@@ -184,6 +184,7 @@ where
     let mut preprocessor_args = vec![];
     let mut depfile = None;
 
+    // Keep the raw arguments so Tasking can process native response files later.
     let original_arguments = arguments;
     let arguments = ExpandOptionFiles::new(cwd, original_arguments);
 
@@ -306,6 +307,10 @@ where
     })
 }
 
+/// Rebuild compiler options without the build controls supplied by sccache.
+///
+/// Tasking's native response-file handling must be retained because expanding
+/// an option file into ordinary arguments can change compiler behavior.
 fn tasking_command_args(arguments: &[OsString], input: &OsStr) -> Vec<OsString> {
     let mut command_args = vec![];
     let mut skip_next = false;
@@ -531,6 +536,7 @@ fn split_option_file_args(contents: &str) -> Result<Vec<OsString>> {
                 continue;
             }
 
+            // Preserve escaped quotes in defines such as `-DNAME=\"value\"`.
             if matches!(contents.get(index + 1), Some('\'' | '"')) {
                 argument.push(contents[index + 1]);
                 index += 2;

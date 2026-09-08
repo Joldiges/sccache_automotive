@@ -1441,6 +1441,7 @@ impl pkg::ToolchainPackager for CToolchainPackager {
 }
 
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
+/// Version 14 also invalidates entries from the pre-fix Tasking path.
 pub const CACHE_VERSION: &[u8] = b"14";
 
 const PREFIX_MAP_FLAGS: [&[u8]; 3] = [

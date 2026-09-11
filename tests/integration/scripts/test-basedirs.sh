@@ -11,7 +11,10 @@ autotools() (
     cd "$1"
     autoreconf -i >/dev/null 2>&1 || true
     automake --add-missing >/dev/null 2>&1 || true
-    ./configure CXX="$SCCACHE g++" >/dev/null 2>&1
+    ./configure \
+        CXX="$SCCACHE g++" \
+        CXXFLAGS="-g -ffile-prefix-map=$1=/workspace" \
+        >/dev/null 2>&1
     make >/dev/null 2>&1
 )
 
@@ -74,6 +77,15 @@ test_backend() {
     else
         echo "✗ FAIL: $backend_name - Basedir test failed, cache misses did not remain the same: $FIRST_MISSES != $SECOND_MISSES"
         echo "$STATS_JSON" | python3 -m json.tool
+        exit 1
+    fi
+
+    if grep -a -q "/build/dir1" /build/dir2/libbasedirs.a; then
+        echo "✗ FAIL: $backend_name - cached object retained the first build directory"
+        exit 1
+    fi
+    if ! grep -a -q "/workspace/main.cpp" /build/dir2/libbasedirs.a; then
+        echo "✗ FAIL: $backend_name - compiler prefix mapping was not retained"
         exit 1
     fi
 

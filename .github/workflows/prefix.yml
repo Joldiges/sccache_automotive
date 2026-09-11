@@ -18,14 +18,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          - os: self-hosted
             target: linux-64
           - os: windows-2022
             target: win-64
-          - os: macos-14
-            target: osx-64
-          - os: macos-14
-            target: osx-arm64
 
     steps:
       - name: Clone repository

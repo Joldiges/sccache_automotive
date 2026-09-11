@@ -33,7 +33,7 @@ use futures::TryFutureExt;
 use log::Level::Trace;
 use std::{
     collections::HashMap,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -184,7 +184,9 @@ where
     let mut preprocessor_args = vec![];
     let mut depfile = None;
 
-    let arguments = ExpandOptionFiles::new(cwd, arguments);
+    // Keep the raw arguments so Tasking can process native response files later.
+    let original_arguments = arguments;
+    let arguments = ExpandOptionFiles::new(cwd, original_arguments);
 
     for arg in ArgsIter::new(arguments, arg_info) {
         let arg = try_or_cannot_cache!(arg, "argument parse");
@@ -237,7 +239,8 @@ where
             Some(s) if s.len() == 2 => NormalizedDisposition::Concatenated,
             _ => NormalizedDisposition::Separated,
         };
-        args.extend(arg.normalize(norm).iter_os_strings());
+        let normalized = arg.normalize(norm);
+        args.extend(normalized.iter_os_strings());
     }
 
     // We only support compilation.
@@ -269,6 +272,7 @@ where
     });
 
     let output = output_arg.unwrap_or_else(|| Path::new(&input).with_extension("o"));
+    let command_args = tasking_command_args(original_arguments, &input);
 
     let mut outputs = HashMap::with_capacity(1);
     outputs.insert(
@@ -290,7 +294,9 @@ where
         preprocessor_args,
         common_args,
         arch_args: vec![],
-        unhashed_args: vec![],
+        // Tasking's native response-file handling is required for compilation.
+        // The expanded arguments above remain split for cache-key construction.
+        unhashed_args: command_args,
         extra_dist_files: vec![],
         extra_hash_files: vec![],
         uses_external_assembler: false,
@@ -300,6 +306,42 @@ where
         suppress_rewrite_includes_only: false,
         too_hard_for_preprocessor_cache_mode: None,
     })
+}
+
+/// Rebuild compiler options without the build controls supplied by sccache.
+///
+/// Tasking's native response-file handling must be retained because expanding
+/// an option file into ordinary arguments can change compiler behavior.
+fn tasking_command_args(arguments: &[OsString], input: &OsStr) -> Vec<OsString> {
+    let mut command_args = vec![];
+    let mut skip_next = false;
+
+    for argument in arguments {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        if argument == "-c" {
+            continue;
+        }
+        if argument == "-o" || argument == "--output" || argument == "--dep-file" {
+            skip_next = true;
+            continue;
+        }
+        if let Some(argument) = argument.to_str()
+            && (argument.starts_with("--output=") || argument.starts_with("--dep-file="))
+        {
+            continue;
+        }
+        if argument == input {
+            continue;
+        }
+
+        command_args.push(argument.clone());
+    }
+
+    command_args
 }
 
 struct ExpandOptionFiles<'a> {
@@ -494,6 +536,13 @@ fn split_option_file_args(contents: &str) -> Result<Vec<OsString>> {
                 }
                 continue;
             }
+
+            // Preserve escaped quotes in defines such as `-DNAME=\"value\"`.
+            if matches!(contents.get(index + 1), Some('\'' | '"')) {
+                argument.push(contents[index + 1]);
+                index += 2;
+                continue;
+            }
         }
 
         match quote {
@@ -532,10 +581,15 @@ where
 {
     let mut preprocess = creator.clone().new_command_sync(executable);
     preprocess
+        // Tasking's standalone C preprocessor expands its built-in `true` and
+        // `false` macros to pragma expressions that are invalid in `#if`.
+        // The compiler's normal C compilation path accepts these expressions.
+        // Force its C++ preprocessing mode so cache-key generation matches the
+        // compiler path used for the actual object build.
+        .arg("--force-c++")
         .arg("-E")
         .arg(&parsed_args.input)
-        .args(&parsed_args.preprocessor_args)
-        .args(&parsed_args.common_args)
+        .args(&parsed_args.unhashed_args)
         .env_clear()
         .envs(env_vars.to_vec())
         .current_dir(cwd);
@@ -560,12 +614,12 @@ where
     if let Some(ref depfile) = parsed_args.depfile {
         let mut generate_depfile = creator.clone().new_command_sync(executable);
         generate_depfile
+            .arg("--force-c++")
             .arg("-Em")
             .arg("-o")
             .arg(depfile)
             .arg(&parsed_args.input)
-            .args(&parsed_args.preprocessor_args)
-            .args(&parsed_args.common_args)
+            .args(&parsed_args.unhashed_args)
             .env_clear()
             .envs(env_vars.to_vec())
             .current_dir(cwd);
@@ -604,9 +658,7 @@ fn generate_compile_commands(
         "-o".into(),
         out_file.path.as_os_str().into(),
     ];
-    arguments.extend_from_slice(&parsed_args.preprocessor_args);
     arguments.extend_from_slice(&parsed_args.unhashed_args);
-    arguments.extend_from_slice(&parsed_args.common_args);
     let command = SingleCompileCommand {
         executable: executable.to_owned(),
         arguments,
@@ -621,7 +673,7 @@ fn generate_compile_commands(
 mod test {
     use super::{
         ARGS, Language, OsString, ParsedArguments, PathBuf, dist, generate_compile_commands,
-        parse_arguments, split_option_file_args,
+        parse_arguments, preprocess, split_option_file_args,
     };
     use crate::compiler::c::ArtifactDescriptor;
     use crate::compiler::*;
@@ -838,6 +890,7 @@ mod test {
             input,
             outputs,
             preprocessor_args,
+            unhashed_args,
             ..
         } = match parse_arguments_in(
             stringvec!["-f", "options", "-c", "foo.c", "-o", "foo.o"],
@@ -859,9 +912,112 @@ mod test {
             )
         );
         assert_eq!(
-            ovec!["-Iinclude directory", r#"-DVALUE=\Debug\"#],
+            ovec!["-Iinclude directory", r#"-DVALUE="Debug""#],
             preprocessor_args
         );
+        assert_eq!(ovec!["-f", "options"], unhashed_args);
+    }
+
+    #[test]
+    fn test_parse_arguments_preserves_tasking_option_order() {
+        let ParsedArguments {
+            preprocessor_args,
+            common_args,
+            unhashed_args,
+            ..
+        } = match parse_arguments_(stringvec![
+            "-c",
+            "foo.c",
+            "-Iinclude",
+            "-Llib",
+            "-DSECOND=2",
+            "--unknown=abc"
+        ]) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("Got unexpected parse result: {other:?}"),
+        };
+
+        assert_eq!(ovec!["-Iinclude", "-DSECOND=2"], preprocessor_args);
+        assert_eq!(ovec!["-Llib", "--unknown=abc"], common_args);
+        assert_eq!(
+            ovec!["-Iinclude", "-Llib", "-DSECOND=2", "--unknown=abc"],
+            unhashed_args
+        );
+    }
+
+    #[test]
+    fn test_preprocess_preserves_tasking_option_order() {
+        let creator = new_creator();
+        let parsed_args = match parse_arguments_(stringvec![
+            "-c",
+            "foo.c",
+            "-Iinclude",
+            "-Llib",
+            "-DSECOND=2"
+        ]) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("Got unexpected parse result: {other:?}"),
+        };
+        creator.lock().unwrap().next_command_calls(|args| {
+            assert_eq!(
+                ovec![
+                    "--force-c++",
+                    "-E",
+                    "foo.c",
+                    "-Iinclude",
+                    "-Llib",
+                    "-DSECOND=2"
+                ],
+                args
+            );
+            Ok(MockChild::new(exit_status(0), "preprocessed", ""))
+        });
+
+        let runtime = single_threaded_runtime();
+        let output = runtime
+            .block_on(preprocess(
+                &creator,
+                Path::new("ctc"),
+                &parsed_args,
+                Path::new("."),
+                &[],
+                false,
+                false,
+            ))
+            .unwrap();
+        assert_eq!(b"preprocessed".to_vec(), output.stdout);
+    }
+
+    #[test]
+    fn test_preprocess_preserves_tasking_response_file() {
+        let fixture = TestFixture::new();
+        fs::write(fixture.tempdir.path().join("options"), "-Iinclude").unwrap();
+        let creator = new_creator();
+        let parsed_args = match parse_arguments_in(
+            stringvec!["-f", "options", "-c", "foo.c"],
+            fixture.tempdir.path(),
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("Got unexpected parse result: {other:?}"),
+        };
+        creator.lock().unwrap().next_command_calls(|args| {
+            assert_eq!(ovec!["--force-c++", "-E", "foo.c", "-f", "options"], args);
+            Ok(MockChild::new(exit_status(0), "preprocessed", ""))
+        });
+
+        let runtime = single_threaded_runtime();
+        let output = runtime
+            .block_on(preprocess(
+                &creator,
+                Path::new("ctc"),
+                &parsed_args,
+                fixture.tempdir.path(),
+                &[],
+                false,
+                false,
+            ))
+            .unwrap();
+        assert_eq!(b"preprocessed".to_vec(), output.stdout);
     }
 
     #[test]
@@ -1085,7 +1241,7 @@ mod test {
     #[test]
     fn test_split_option_file_args() {
         assert_eq!(
-            ovec!["-DNAME=a b", r#"-DVALUE=\Debug\"#, "foo.c"],
+            ovec!["-DNAME=a b", r#"-DVALUE="Debug""#, "foo.c"],
             split_option_file_args(r#"-DNAME="a b" -DVALUE=\"Debug\" foo.c"#).unwrap()
         );
     }

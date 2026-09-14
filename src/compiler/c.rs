@@ -27,7 +27,7 @@ use crate::dist::pkg;
 use crate::mock_command::CommandCreatorSync;
 use crate::util::{
     Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path,
-    hash_all, strip_basedirs,
+    hash_all, strip_basedirs, strip_basedirs_from_arg,
 };
 use async_trait::async_trait;
 use fs_err as fs;
@@ -1511,6 +1511,37 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
     .collect()
 });
 
+/// Feed the compiler arguments into `m`, with the base directories stripped.
+///
+/// Prefix-map source paths are normalized only when they name a configured
+/// basedir, leaving their destinations and subdirectories meaningful.
+pub fn hash_arguments(m: &mut Digest, arguments: &[OsString], basedirs: &[Vec<u8>]) {
+    for arg in arguments {
+        let bytes = arg.as_encoded_bytes();
+        if PREFIX_MAP_FLAGS
+            .iter()
+            .any(|prefix| bytes.starts_with(prefix))
+        {
+            if let Some(normalized) = normalize_prefix_map_argument(arg, basedirs) {
+                m.update(b"\x01");
+                normalized.hash(&mut HashToDigest { digest: m });
+            } else {
+                m.update(b"\x00");
+                arg.hash(&mut HashToDigest { digest: m });
+            }
+        } else {
+            // Same shape as OsString's own Hash impl: the bytes, then a separator
+            // that cannot occur in them.
+            if bytes.starts_with(b"-D") {
+                m.update(bytes);
+            } else {
+                m.update(&strip_basedirs_from_arg(bytes, basedirs));
+            }
+            m.update(&[0xff]);
+        }
+    }
+}
+
 /// Parameters for computing a hash key for C/C++ compilation caching.
 ///
 /// Construct with required fields via [`HashKeyParams::new`], then add optional
@@ -1616,15 +1647,7 @@ impl<'a> HashKeyParams<'a> {
         m.update(&[self.plusplus as u8]);
         m.update(CACHE_VERSION);
         m.update(self.language.as_str().as_bytes());
-        for arg in self.arguments {
-            if let Some(normalized) = normalize_prefix_map_argument(arg, self.basedirs) {
-                m.update(b"\x01");
-                normalized.hash(&mut HashToDigest { digest: &mut m });
-            } else {
-                m.update(b"\x00");
-                arg.hash(&mut HashToDigest { digest: &mut m });
-            }
-        }
+        hash_arguments(&mut m, self.arguments, self.basedirs);
         for hash in self.extra_hashes {
             m.update(hash.as_bytes());
         }

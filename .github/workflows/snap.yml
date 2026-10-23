@@ -22,5 +22,6 @@ jobs:
         snapcraft-channel: edge
         review-opts: --allow-classic
         snapcraft-token: ${{ secrets.SNAPCRAFT_TOKEN }}
-        publish: ${{ github.event_name == 'pull_request' && github.repository == github.event.pull_request.head.repo.full_name }}
+        # Without the secret, still build and review the snap but skip publishing.
+        publish: ${{ github.event_name == 'pull_request' && github.repository == github.event.pull_request.head.repo.full_name && secrets.SNAPCRAFT_TOKEN != '' }}
         publish-channel: edge/pr${{ github.event.number }}

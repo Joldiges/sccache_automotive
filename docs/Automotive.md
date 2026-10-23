@@ -33,6 +33,23 @@ Each proprietary compiler change must also be tested with a licensed real
 compiler, an unchanged warm rebuild, and cached-versus-pass-through output
 comparison. Only sanitized aggregate results belong in this public repository.
 
+### TASKING dependency artifacts
+
+TASKING dependency files must be stored with the object and restored on direct
+cache hits. Dependency generation must also remain enabled in the compilation
+command: a preprocessing manifest can survive eviction of its object-cache
+entry, so a manifest hit does not guarantee that the object or depfile exists.
+Test this transition by preserving the manifest, removing the object-cache
+entry and local outputs, and compiling again.
+
+Dependency-file paths participate in both cache keys. This separates requests
+with different dependency outputs and invalidates older TASKING entries that
+did not reliably store dependency files.
+
+Exercise client-side and server-side compilation separately. Setting
+`SCCACHE_LOG` currently disables client-side mode, so a logged reproduction
+alone does not validate `SCCACHE_CLIENT_SIDE=1`.
+
 ## Private package workflow
 
 Private packages are built from an exact combined-branch commit by downstream

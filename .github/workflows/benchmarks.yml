@@ -30,6 +30,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install build tools
+        uses: ./.github/actions/linux-build-tools
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2

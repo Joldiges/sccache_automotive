@@ -282,6 +282,21 @@ where
             optional: false,
         },
     );
+    let mut dependency_args = vec![];
+    if let Some(ref depfile) = depfile {
+        let mut argument = OsString::from("--dep-file=");
+        argument.push(depfile);
+        // Separate both cache keys from requests without a depfile, including old entries.
+        common_args.push(argument.clone());
+        dependency_args.push(argument);
+        outputs.insert(
+            "d",
+            ArtifactDescriptor {
+                path: depfile.clone(),
+                optional: false,
+            },
+        );
+    }
 
     CompilerArguments::Ok(ParsedArguments {
         input: input.into(),
@@ -290,7 +305,7 @@ where
         compilation_flag: "-c".into(),
         depfile,
         outputs,
-        dependency_args: vec![],
+        dependency_args,
         preprocessor_args,
         common_args,
         arch_args: vec![],
@@ -323,10 +338,10 @@ fn tasking_command_args(arguments: &[OsString], input: &OsStr) -> Vec<OsString> 
             continue;
         }
 
-        if argument == "-c" {
+        if argument == "-c" || argument == "--dep-file" {
             continue;
         }
-        if argument == "-o" || argument == "--output" || argument == "--dep-file" {
+        if argument == "-o" || argument == "--output" {
             skip_next = true;
             continue;
         }
@@ -660,6 +675,8 @@ fn generate_compile_commands(
         out_file.path.as_os_str().into(),
     ];
     arguments.extend_from_slice(&parsed_args.unhashed_args);
+    // A direct-mode manifest hit can skip the preprocessing that normally creates this file.
+    arguments.extend_from_slice(&parsed_args.dependency_args);
     let command = SingleCompileCommand {
         executable: executable.to_owned(),
         arguments,
@@ -677,13 +694,16 @@ mod test {
         ARGS, Language, OsString, ParsedArguments, PathBuf, dist, generate_compile_commands,
         parse_arguments, preprocess, split_option_file_args,
     };
+    use crate::cache::{CacheMode, disk::DiskCache};
     use crate::compiler::c::ArtifactDescriptor;
     use crate::compiler::*;
+    use crate::config::PreprocessorCacheModeConfig;
     use crate::mock_command::*;
     use crate::server;
     use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
-    use std::{fs, path::Path};
+    use std::{fs, path::Path, sync::Arc};
+    use test_case::test_case;
 
     fn parse_arguments_(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
         let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
@@ -1324,10 +1344,17 @@ mod test {
                     path: PathBuf::from("foo.o"),
                     optional: false
                 }
+            ),
+            (
+                "d",
+                ArtifactDescriptor {
+                    path: PathBuf::from("depfile"),
+                    optional: false
+                }
             )
         );
         assert!(preprocessor_args.is_empty());
-        assert_eq!(ovec!["--unknown=abc"], common_args);
+        assert_eq!(ovec!["--unknown=abc", "--dep-file=depfile"], common_args);
         assert!(!msvc_show_includes);
     }
 
@@ -1342,6 +1369,7 @@ mod test {
             preprocessor_args,
             msvc_show_includes,
             common_args,
+            unhashed_args,
             ..
         } = match parse_arguments_(args) {
             CompilerArguments::Ok(args) => args,
@@ -1358,11 +1386,303 @@ mod test {
                     path: PathBuf::from("foo.o"),
                     optional: false
                 }
+            ),
+            (
+                "d",
+                ArtifactDescriptor {
+                    path: PathBuf::from("foo.d"),
+                    optional: false
+                }
             )
         );
         assert!(preprocessor_args.is_empty());
-        assert_eq!(ovec!["--unknown=abc"], common_args);
+        assert_eq!(ovec!["--unknown=abc", "--dep-file=foo.d"], common_args);
+        assert_eq!(ovec!["--unknown=abc"], unhashed_args);
         assert!(!msvc_show_includes);
+    }
+
+    #[test]
+    fn test_dependency_paths_affect_cache_keys() {
+        let fixture = TestFixture::new();
+        let source = fixture.tempdir.path().join("foo.c");
+        fs::write(&source, "int value;\n").unwrap();
+        let mut keys = vec![];
+        let mut direct_keys = vec![];
+        for option in [
+            None,
+            Some("--dep-file=first.d"),
+            Some("--dep-file=second.d"),
+        ] {
+            let mut arguments = stringvec!["-c", "foo.c"];
+            if let Some(option) = option {
+                arguments.push(option.to_owned());
+            }
+            let parsed = match parse_arguments_(arguments) {
+                CompilerArguments::Ok(args) => args,
+                other => panic!("Got unexpected parse result: {other:?}"),
+            };
+            keys.push(
+                crate::compiler::c::HashKeyParams::new(
+                    "compiler",
+                    Language::C,
+                    &parsed.common_args,
+                    b"preprocessed",
+                )
+                .compute(),
+            );
+            direct_keys.push(
+                crate::compiler::preprocessor_cache::preprocessor_cache_entry_hash_key(
+                    "compiler",
+                    Language::C,
+                    &parsed.common_args,
+                    &[],
+                    None,
+                    &[],
+                    &source,
+                    false,
+                    PreprocessorCacheModeConfig::default(),
+                    &[],
+                )
+                .unwrap()
+                .unwrap(),
+            );
+        }
+        for hashes in [keys, direct_keys] {
+            assert_ne!(hashes[0], hashes[1]);
+            assert_ne!(hashes[1], hashes[2]);
+            assert_ne!(hashes[0], hashes[2]);
+        }
+    }
+
+    #[test_case("--dep-file=build directory/foo.obj.d", "build directory/foo.obj.d"; "explicit")]
+    #[test_case("--dep-file", "foo.d"; "implicit")]
+    fn test_compile_dependency_file(option: &str, depfile: &str) {
+        let fixture = TestFixture::new();
+        fs::write(
+            fixture.tempdir.path().join("options"),
+            format!("\"{option}\""),
+        )
+        .unwrap();
+        let parsed_args = match parse_arguments_in(
+            stringvec!["-foptions", "-c", "foo.c", "-o", "foo.obj"],
+            fixture.tempdir.path(),
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("Got unexpected parse result: {other:?}"),
+        };
+        let (command, _, _) = generate_compile_commands(
+            &mut dist::PathTransformer::new(),
+            &fixture.bins[0],
+            &parsed_args,
+            fixture.tempdir.path(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            ovec![
+                "-c",
+                "foo.c",
+                "-o",
+                "foo.obj",
+                "-foptions",
+                format!("--dep-file={depfile}")
+            ],
+            command.arguments
+        );
+        assert_eq!(PathBuf::from(depfile), parsed_args.outputs["d"].path);
+        assert_eq!(
+            ovec![format!("--dep-file={depfile}")],
+            parsed_args.common_args
+        );
+    }
+
+    #[test]
+    fn test_preprocess_dependency_generation_failure() {
+        let creator = new_creator();
+        let parsed_args = match parse_arguments_(stringvec!["-c", "foo.c", "--dep-file=foo.d"]) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("Got unexpected parse result: {other:?}"),
+        };
+        next_command_calls(&creator, |_| {
+            panic!("preprocessing must not run after dependency failure")
+        });
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(1), "", "dependency failure")),
+        );
+        let runtime = single_threaded_runtime();
+        let error = runtime
+            .block_on(preprocess(
+                &creator,
+                Path::new("ctc"),
+                &parsed_args,
+                Path::new("."),
+                &[],
+                false,
+                false,
+            ))
+            .unwrap_err();
+        let output = error.downcast::<crate::errors::ProcessError>().unwrap().0;
+        assert!(!output.status.success());
+        assert_eq!(b"dependency failure", output.stderr.as_slice());
+        assert!(creator.lock().unwrap().children.is_empty());
+    }
+
+    #[test_case(true; "direct")]
+    #[test_case(false; "preprocessed")]
+    fn test_dependency_artifact_cache_lifecycle(direct: bool) {
+        let fixture = TestFixture::new();
+        let cwd = fixture.tempdir.path();
+        fs::write(cwd.join("foo.c"), "#include \"header.h\"\n").unwrap();
+        fs::write(cwd.join("header.h"), "#define VALUE 1\n").unwrap();
+        fs::write(cwd.join("options"), "-DOPTION=1").unwrap();
+        for file in ["foo.c", "header.h"] {
+            filetime::set_file_mtime(cwd.join(file), filetime::FileTime::from_unix_time(1, 0))
+                .unwrap();
+        }
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle().clone();
+        let creator = new_creator();
+        let compiler = runtime
+            .block_on(crate::compiler::c::CCompiler::new(
+                super::TaskingVX,
+                fixture.bins[0].clone(),
+                &pool,
+            ))
+            .unwrap();
+        let arguments = ovec![
+            "-foptions",
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "--dep-file=foo.o.d"
+        ];
+        let mut hasher = match compiler.parse_arguments(&arguments, cwd, &[]) {
+            CompilerArguments::Ok(hasher) => hasher,
+            other => panic!("Got unexpected parse result: {other:?}"),
+        };
+        let cache_root = cwd.join("cache");
+        let obj = cwd.join("foo.o");
+        let dep = cwd.join("foo.o.d");
+        let dependencies = b"foo.o : foo.c header.h\n";
+        for stage in ["cold", "warm", "evicted", "changed header"] {
+            if stage == "evicted" && !direct {
+                continue;
+            }
+            let changed_header = stage == "changed header";
+            let storage = Arc::new(DiskCache::new(
+                &cache_root,
+                u64::MAX,
+                &pool,
+                PreprocessorCacheModeConfig {
+                    use_preprocessor_cache_mode: direct,
+                    ..Default::default()
+                },
+                CacheMode::ReadWrite,
+                vec![],
+            ));
+            let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
+            if stage == "evicted" {
+                let hash = runtime
+                    .block_on(hasher.generate_hash_key(
+                        &creator,
+                        cwd.to_path_buf(),
+                        vec![],
+                        false,
+                        &pool,
+                        false,
+                        storage.clone(),
+                        CacheControl::Default,
+                    ))
+                    .unwrap();
+                assert!(!hash.compilation.is_locally_preprocessed());
+                fs::remove_file(
+                    cache_root
+                        .join(&hash.key[..1])
+                        .join(&hash.key[1..2])
+                        .join(&hash.key),
+                )
+                .unwrap();
+            }
+            if changed_header {
+                fs::write(cwd.join("header.h"), "#define VALUE 2\n").unwrap();
+                filetime::set_file_mtime(
+                    cwd.join("header.h"),
+                    filetime::FileTime::from_unix_time(2, 0),
+                )
+                .unwrap();
+            }
+            for path in [&obj, &dep] {
+                if path.exists() {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+            if !direct || stage == "cold" || changed_header {
+                next_command(
+                    &creator,
+                    Ok(MockChild::new(
+                        exit_status(0),
+                        format!(
+                            "#line 1 \"foo.c\"\n#line 1 \"header.h\"\nint value = {};\n",
+                            if changed_header { 2 } else { 1 }
+                        ),
+                        "",
+                    )),
+                );
+                let dep = dep.clone();
+                next_command_calls(&creator, move |args| {
+                    assert!(args.iter().any(|arg| arg == "-Em"));
+                    fs::write(&dep, dependencies)?;
+                    Ok(MockChild::new(exit_status(0), "", ""))
+                });
+            }
+            if stage != "warm" {
+                let obj = obj.clone();
+                let dep = dep.clone();
+                next_command_calls(&creator, move |args| {
+                    fs::write(&obj, if changed_header { "object2" } else { "object1" })?;
+                    if args.iter().any(|arg| arg == "--dep-file=foo.o.d") {
+                        fs::write(&dep, dependencies)?;
+                    }
+                    Ok(MockChild::new(exit_status(0), "", ""))
+                });
+            }
+            let (result, output) = runtime
+                .block_on(hasher.get_cached_or_compile(
+                    &service,
+                    None,
+                    creator.clone(),
+                    storage,
+                    arguments.clone(),
+                    cwd.to_path_buf(),
+                    vec![],
+                    CacheControl::Default,
+                    pool.clone(),
+                ))
+                .unwrap();
+            assert!(output.status.success());
+            if stage == "warm" {
+                assert!(matches!(result, CompileResult::CacheHit(_)), "{result:?}");
+            } else {
+                match result {
+                    CompileResult::CacheMiss(_, _, _, write) => {
+                        runtime.block_on(write).unwrap();
+                    }
+                    other => panic!("Expected cache miss, got {other:?}"),
+                }
+            }
+            assert_eq!(
+                if changed_header { "object2" } else { "object1" },
+                fs::read_to_string(&obj).unwrap()
+            );
+            assert_eq!(
+                dependencies,
+                fs::read(&dep).unwrap().as_slice(),
+                "stage {stage}"
+            );
+            assert!(creator.lock().unwrap().children.is_empty());
+        }
     }
 
     #[test]

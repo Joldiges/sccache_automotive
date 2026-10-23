@@ -1440,6 +1440,7 @@ mod test {
                     &[],
                     &source,
                     false,
+                    parsed.is_multiarch(),
                     PreprocessorCacheModeConfig::default(),
                     &[],
                 )

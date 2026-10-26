@@ -109,6 +109,8 @@ ArgData! { pub
     PassThrough(OsString),
     PreprocessorArgument(OsString),
     PreprocessorArgumentPath(PathBuf),
+    DepModeFlag,
+    DepMode(OsString),
     DepArgumentFlag,
     DepArgument(OsString),
     DepArgumentPath(PathBuf),
@@ -133,7 +135,8 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     flag!("-V", TooHardFlag),
     flag!("-VV", TooHardFlag),
     take_arg!("-W", OsString, Separated, PassThrough),
-    flag!("-Xmake-dependency", DepArgumentFlag),
+    flag!("-Xmake-dependency", DepModeFlag),
+    flag!("-Xmake-dependency-canonicalize-path", DepArgumentFlag),
     flag!(
         "-Xmake-dependency-canonicalize-path-off",
         DepArgumentFlag
@@ -150,6 +153,7 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
         Concatenated(b'='),
         DepArgument
     ),
+    take_arg!("-Xmake-dependency=", OsString, Concatenated, DepMode),
     flag!("-c", DoCompilation),
     take_arg!(
         "-include",
@@ -187,6 +191,9 @@ where
     let mut output_arg = None;
     let mut preprocessor_args = vec![];
     let mut dependency_args = vec![];
+    let mut dependency_mode = None;
+    let mut dependency_path = None;
+    let mut dependency_target = false;
 
     // Custom iterator to expand `@` arguments which stand for reading a file
     // and interpreting it as a list of more arguments.
@@ -219,7 +226,18 @@ where
                 cannot_cache!(arg.flag_str().expect("Can't be Argument::Raw/UnknownFlag",))
             }
 
-            Some(DepArgument(_)) | Some(DepArgumentFlag) | Some(DepArgumentPath(_)) => {}
+            Some(DepModeFlag) => dependency_mode = Some(1),
+            Some(DepMode(mode)) => {
+                dependency_mode = Some(
+                    match mode.to_str().and_then(|s| u32::from_str_radix(s, 16).ok()) {
+                        Some(mode) => mode,
+                        None => cannot_cache!("invalid dependency mode"),
+                    },
+                );
+            }
+            Some(DepArgumentPath(path)) => dependency_path = Some(path.clone()),
+            Some(DepArgument(_)) => dependency_target = true,
+            Some(DepArgumentFlag) => {}
 
             Some(DoCompilation) => {
                 compilation = true;
@@ -243,9 +261,11 @@ where
         }
         let args = match arg.get_data() {
             Some(PassThrough(_)) => &mut common_args,
-            Some(DepArgument(_)) | Some(DepArgumentFlag) | Some(DepArgumentPath(_)) => {
-                &mut dependency_args
-            }
+            Some(DepModeFlag)
+            | Some(DepMode(_))
+            | Some(DepArgument(_))
+            | Some(DepArgumentFlag)
+            | Some(DepArgumentPath(_)) => &mut dependency_args,
             Some(PreprocessorArgument(_)) | Some(PreprocessorArgumentPath(_)) => {
                 &mut preprocessor_args
             }
@@ -271,6 +291,9 @@ where
     if !compilation {
         return CompilerArguments::NotCompilation;
     }
+    if dependency_mode.is_some_and(|mode| mode & 4 == 0) {
+        return CompilerArguments::NotCompilation;
+    }
     // Can't cache compilations with multiple inputs.
     if multiple_input {
         cannot_cache!("multiple input files");
@@ -288,6 +311,27 @@ where
     let output = output_arg.unwrap_or_else(|| Path::new(&input).with_extension("o"));
 
     let mut outputs = HashMap::new();
+    if dependency_mode.is_some() {
+        let path = dependency_path.unwrap_or_else(|| {
+            let mut path = output.clone().into_os_string();
+            path.push(".d");
+            PathBuf::from(path)
+        });
+        if !dependency_target {
+            let mut target = OsString::from("-Xmake-dependency-target=");
+            target.push(&output);
+            dependency_args.push(target);
+        }
+        outputs.insert(
+            "d",
+            ArtifactDescriptor {
+                path,
+                optional: false,
+            },
+        );
+    }
+    // Hash dependency outputs and retain generation on manifest hits followed by object misses.
+    common_args.extend_from_slice(&dependency_args);
     outputs.insert(
         "obj",
         ArtifactDescriptor {
@@ -335,7 +379,6 @@ where
     let mut cmd = creator.clone().new_command_sync(executable);
     cmd.arg("-E")
         .arg(&parsed_args.input)
-        .args(&parsed_args.dependency_args)
         .args(&parsed_args.preprocessor_args)
         .args(&parsed_args.common_args)
         .env_clear()
@@ -470,6 +513,7 @@ mod test {
     use crate::test::utils::*;
     use fs::File;
     use std::io::Write;
+    use std::path::Path;
 
     fn parse_arguments_(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
         let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
@@ -612,7 +656,7 @@ mod test {
             "-c",
             "foo.c",
             "-fabc",
-            "-Xmake-dependency",
+            "-Xmake-dependency=5",
             "-Xmake-dependency-canonicalize-path-off",
             "-Xmake-dependency-savefile=bar",
             "-Xmake-dependency-target=foo",
@@ -641,19 +685,154 @@ mod test {
                     path: "foo.o".into(),
                     optional: false
                 }
+            ),
+            (
+                "d",
+                ArtifactDescriptor {
+                    path: "bar".into(),
+                    optional: false
+                }
             )
         );
         assert_eq!(
             ovec![
-                "-Xmake-dependency",
+                "-Xmake-dependency=5",
                 "-Xmake-dependency-canonicalize-path-off",
                 "-Xmake-dependency-savefile=bar",
                 "-Xmake-dependency-target=foo"
             ],
             dependency_args
         );
-        assert_eq!(ovec!["-fabc"], common_args);
+        assert_eq!(
+            ovec![
+                "-fabc",
+                "-Xmake-dependency=5",
+                "-Xmake-dependency-canonicalize-path-off",
+                "-Xmake-dependency-savefile=bar",
+                "-Xmake-dependency-target=foo"
+            ],
+            common_args
+        );
+        assert_eq!(outputs["d"].path, Path::new("bar"));
         assert!(!msvc_show_includes);
+    }
+
+    #[test]
+    fn test_dependency_only_is_not_compilation() {
+        for option in [
+            "-Xmake-dependency",
+            "-Xmake-dependency=1",
+            "-Xmake-dependency=2",
+            "-Xmake-dependency=a",
+        ] {
+            assert_eq!(
+                CompilerArguments::NotCompilation,
+                parse_arguments_(stringvec!["-c", "foo.c", option])
+            );
+        }
+    }
+
+    #[test]
+    fn test_dependency_generation_survives_manifest_hit_object_miss() {
+        let parsed = match parse_arguments_(stringvec![
+            "-c",
+            "foo.c",
+            "-o",
+            "build directory/foo.obj",
+            "-Xmake-dependency=5",
+            "-Xmake-dependency-canonicalize-path"
+        ]) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("Got unexpected parse result: {other:?}"),
+        };
+        assert_eq!(
+            parsed.outputs["d"],
+            ArtifactDescriptor {
+                path: "build directory/foo.obj.d".into(),
+                optional: false,
+            }
+        );
+        let fixture = TestFixture::new();
+        let (command, _, _) = generate_compile_commands(
+            &mut dist::PathTransformer::new(),
+            &fixture.bins[0],
+            &parsed,
+            fixture.tempdir.path(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            command.arguments,
+            ovec![
+                "-c",
+                "foo.c",
+                "-o",
+                "build directory/foo.obj",
+                "-Xmake-dependency=5",
+                "-Xmake-dependency-canonicalize-path",
+                "-Xmake-dependency-target=build directory/foo.obj"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_dependency_options_affect_cache_keys() {
+        let fixture = TestFixture::new();
+        let source = fixture.tempdir.path().join("foo.c");
+        fs::write(&source, "int value;\n").unwrap();
+        let mut keys = vec![];
+        let mut direct_keys = vec![];
+        for options in [
+            vec![],
+            stringvec!["-Xmake-dependency=5", "-Xmake-dependency-savefile=first.d"],
+            stringvec!["-Xmake-dependency=5", "-Xmake-dependency-savefile=second.d"],
+            stringvec![
+                "-Xmake-dependency=5",
+                "-Xmake-dependency-savefile=first.d",
+                "-Xmake-dependency-target=other.obj"
+            ],
+            stringvec!["-Xmake-dependency=6", "-Xmake-dependency-savefile=first.d"],
+        ] {
+            let mut args = stringvec!["-c", "foo.c", "-o", "foo.obj"];
+            args.extend(options);
+            let parsed = match parse_arguments_(args) {
+                CompilerArguments::Ok(args) => args,
+                other => panic!("Got unexpected parse result: {other:?}"),
+            };
+            keys.push(
+                crate::compiler::c::HashKeyParams::new(
+                    "compiler",
+                    Language::C,
+                    &parsed.common_args,
+                    b"preprocessed",
+                )
+                .compute(),
+            );
+            direct_keys.push(
+                crate::compiler::preprocessor_cache::preprocessor_cache_entry_hash_key(
+                    "compiler",
+                    Language::C,
+                    &parsed.common_args,
+                    &[],
+                    None,
+                    &[],
+                    &source,
+                    false,
+                    parsed.is_multiarch(),
+                    crate::config::PreprocessorCacheModeConfig::default(),
+                    &[],
+                )
+                .unwrap()
+                .unwrap(),
+            );
+        }
+        for hashes in [keys, direct_keys] {
+            for (index, key) in hashes.iter().enumerate() {
+                for other in &hashes[index + 1..] {
+                    assert_ne!(key, other);
+                }
+            }
+        }
     }
 
     #[test]

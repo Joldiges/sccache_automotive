@@ -14,9 +14,9 @@ The combined integration branch is `automotive/compiler-support`.
 | TASKING VX | Expand `-f` and `--option-file` arguments safely | `upstream/tasking-option-files` |
 | Compiler detection | Forward GNU/Clang target options, including response files | `upstream/forward-target-options` |
 
-Wind River Diab was validated against the current implementation without a
-source change. Its observed issues were downstream launcher and license
-environment configuration.
+Wind River Diab dependency artifacts are now tracked alongside objects, with
+dependency options included in both cache keys. This prevents direct hits from
+restoring objects without their dependency files.
 
 ## Validation expectations
 
@@ -49,6 +49,28 @@ did not reliably store dependency files.
 Exercise client-side and server-side compilation separately. Setting
 `SCCACHE_LOG` currently disables client-side mode, so a logged reproduction
 alone does not validate `SCCACHE_CLIENT_SIDE=1`.
+
+### Diab dependency artifacts
+
+Diab's dependency option is a hexadecimal bitmask. Use
+`-Xmake-dependency=5` to generate dependencies for all headers and continue
+compilation; `=1` and `=2` only generate dependencies and do not compile an
+object. Explicit dependency output paths and targets participate in both cache
+keys. Dependency generation remains enabled when a preprocessing manifest hits
+but its object-cache entry has been evicted.
+
+Licensed integration tests compare pass-through, cold-cache, warm-cache, and
+manifest-hit/object-miss outputs in both server-side and client-side modes.
+Set `SCCACHE_TEST_DIAB` to the compiler executable and
+`SCCACHE_TEST_DIAB_TARGET` to its licensed target specification, then run:
+
+```sh
+cargo test --locked --test system test_diab_dependency_artifacts
+```
+
+Build and publish native packages containing this fix before downstream
+projects enable dependency generation with direct caching. A locally verified
+binary does not update previously published packages.
 
 ## Private package workflow
 

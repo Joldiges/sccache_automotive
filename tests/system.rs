@@ -46,6 +46,134 @@ use which::{which, which_in};
 
 mod harness;
 
+#[test_case(false; "server side")]
+#[test_case(true; "client side")]
+fn test_diab_dependency_artifacts(client_side: bool) {
+    let (Some(compiler), Some(target)) = (
+        env::var_os("SCCACHE_TEST_DIAB"),
+        env::var_os("SCCACHE_TEST_DIAB_TARGET"),
+    ) else {
+        eprintln!("Set SCCACHE_TEST_DIAB and SCCACHE_TEST_DIAB_TARGET to run licensed Diab checks");
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let config = temp.path().join("config.json");
+    let cached_config = temp.path().join("cached-config");
+    let cache_config = sccache_client_cfg(temp.path(), true);
+    write_json_cfg(temp.path(), "config.json", &cache_config);
+    let command = || {
+        let mut command = sccache_command();
+        command
+            .env("SCCACHE_SERVER_PORT", port.to_string())
+            .env("SCCACHE_CONF", &config)
+            .env("SCCACHE_CACHED_CONF", &cached_config)
+            .env("SCCACHE_CLIENT_SIDE", if client_side { "1" } else { "0" })
+            .env("SCCACHE_IDLE_TIMEOUT", "60");
+        command
+    };
+    command().arg("--start-server").assert().success();
+    struct Daemon(u16);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let result = sccache_command()
+                .env("SCCACHE_SERVER_PORT", self.0.to_string())
+                .arg("--stop-server")
+                .output();
+            if !matches!(&result, Ok(output) if output.status.success()) {
+                eprintln!("Failed to stop isolated Diab test daemon: {result:?}");
+            }
+        }
+    }
+    let _daemon = Daemon(port);
+    for source in ["probe.c", "probe.cpp"] {
+        write_past_source(
+            temp.path(),
+            source,
+            "#include \"direct.h\"\nint value(void) { return VALUE; }\n",
+        );
+        write_past_source(temp.path(), "direct.h", "#include <indirect.h>\n");
+        write_past_source(temp.path(), "indirect.h", "#define VALUE 42\n");
+        let mut args = vec![OsString::from("-t"), target.clone()];
+        args.extend(
+            [
+                "-c",
+                source,
+                "-I.",
+                "-o",
+                "probe.obj",
+                "-Xmake-dependency=5",
+                "-Xmake-dependency-savefile=probe.d",
+                "-Xmake-dependency-target=probe.obj",
+                "-Xmake-dependency-canonicalize-path",
+            ]
+            .map(OsString::from),
+        );
+        Command::new(&compiler)
+            .args(&args)
+            .current_dir(temp.path())
+            .assert()
+            .success();
+        let object = temp.path().join("probe.obj");
+        let depfile = temp.path().join("probe.d");
+        let expected_object = fs::read(&object).unwrap();
+        let expected_dependencies = fs::read_to_string(&depfile).unwrap();
+        assert!(!expected_object.is_empty());
+        assert!(expected_dependencies.contains("direct.h"));
+        assert!(expected_dependencies.contains("indirect.h"));
+        for _ in 0..2 {
+            fs::remove_file(&object).unwrap();
+            fs::remove_file(&depfile).unwrap();
+            command()
+                .arg(&compiler)
+                .args(&args)
+                .current_dir(temp.path())
+                .assert()
+                .success();
+            assert_eq!(fs::read(&object).unwrap(), expected_object);
+            assert_eq!(fs::read_to_string(&depfile).unwrap(), expected_dependencies);
+        }
+        let cache = temp.path().join("client-cache");
+        assert!(
+            fs::read_dir(cache.join("preprocessor"))
+                .unwrap()
+                .next()
+                .is_some()
+        );
+        for entry in walkdir::WalkDir::new(&cache) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_file() && !entry.path().starts_with(cache.join("preprocessor"))
+            {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        fs::remove_file(&object).unwrap();
+        fs::remove_file(&depfile).unwrap();
+        command()
+            .arg(&compiler)
+            .args(&args)
+            .current_dir(temp.path())
+            .assert()
+            .success();
+        assert_eq!(fs::read(&object).unwrap(), expected_object);
+        assert_eq!(fs::read_to_string(&depfile).unwrap(), expected_dependencies);
+    }
+    let stats: serde_json::Value = serde_json::from_slice(
+        &command()
+            .args(["--show-stats", "--stats-format=json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(stats["stats"]["cache_hits"]["counts"]["C/C++"], 2);
+    assert_eq!(stats["stats"]["cache_misses"]["counts"]["C/C++"], 4);
+}
+
 #[derive(Clone)]
 struct Compiler {
     pub name: &'static str,
@@ -2132,7 +2260,6 @@ fn start_multiarch_server(tempdir: &Path, preprocessor_cache_mode: bool) -> Opti
 
 /// Writes a source file dated in the past, so that the preprocessor cache
 /// doesn't consider it too recent to be trusted.
-#[cfg(target_os = "macos")]
 fn write_past_source(tempdir: &Path, filename: &str, contents: &str) {
     write_source(tempdir, filename, contents);
     let past = filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(10));

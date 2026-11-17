@@ -158,6 +158,7 @@ impl ParsedArguments {
 struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
     is_locally_preprocessed: bool,
+    preprocessor_stderr: Vec<u8>,
     #[cfg(feature = "dist-client")]
     preprocessed_input: Vec<u8>,
     executable: PathBuf,
@@ -204,6 +205,15 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
     /// runs one at all.
     fn assembler_digest(&self) -> Option<String> {
         None
+    }
+    /// Adjust the stdout replayed from a cache hit.
+    fn cached_stdout(
+        &self,
+        _parsed_args: &ParsedArguments,
+        stdout: Vec<u8>,
+        _preprocessor_stderr: &[u8],
+    ) -> Vec<u8> {
+        stdout
     }
     /// Determine whether `arguments` are supported by this compiler.
     fn parse_arguments(
@@ -496,7 +506,7 @@ where
             None
         };
 
-        let (preprocessor_output, include_files) = if needs_preprocessing {
+        let (preprocessor_output, preprocessor_stderr, include_files) = if needs_preprocessing {
             if let Some(preprocessor_key) = &preprocessor_key
                 && cache_control == CacheControl::Default
                 && let Some(mut seekable) = storage
@@ -543,6 +553,7 @@ where
                             compilation: Box::new(CCompilation {
                                 parsed_args: self.parsed_args.clone(),
                                 is_locally_preprocessed: false,
+                                preprocessor_stderr: Vec::new(),
                                 #[cfg(feature = "dist-client")]
                                 preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON.to_vec(),
                                 executable: self.executable.clone(),
@@ -640,11 +651,16 @@ where
                 preprocessor_result.stdout.len()
             );
 
-            (preprocessor_result.stdout, include_files)
+            (
+                preprocessor_result.stdout,
+                preprocessor_result.stderr,
+                include_files,
+            )
         } else {
             // No preprocessing is supported - input is already preprocessed
             (
                 std::fs::read(absolute_input_path.as_path())?,
+                Vec::new(),
                 HashMap::new(),
             )
         };
@@ -665,6 +681,10 @@ where
         .with_plusplus(self.compiler.plusplus())
         .with_basedirs(storage.basedirs())
         .with_assembler_digest(assembler_digest.as_deref())
+        .with_input_file_name(hashed_input_file_name(
+            self.parsed_args.language,
+            &self.parsed_args.input,
+        ))
         .compute();
 
         // Cache the preprocessing step
@@ -700,6 +720,7 @@ where
             compilation: Box::new(CCompilation {
                 parsed_args: self.parsed_args.clone(),
                 is_locally_preprocessed: true,
+                preprocessor_stderr,
                 #[cfg(feature = "dist-client")]
                 preprocessed_input: preprocessor_output,
                 executable: self.executable.clone(),
@@ -732,6 +753,7 @@ const PRAGMA_GCC_PCH_PREPROCESS: &[u8] = b"pragma GCC pch_preprocess";
 const HASH_31_COMMAND_LINE_NEWLINE: &[u8] = b"# 31 \"<command-line>\"\n";
 const HASH_32_COMMAND_LINE_2_NEWLINE: &[u8] = b"# 32 \"<command-line>\" 2\n";
 const INCBIN_DIRECTIVE: &[u8] = b".incbin";
+const COMPRESSED_CLANG_OFFLOAD_BUNDLE_MAGIC: &[u8] = b"CCOB";
 
 /// Remember the include files in the preprocessor output if it can be cached.
 /// Returns `false` if preprocessor cache mode should be disabled.
@@ -744,6 +766,11 @@ fn process_preprocessed_file(
     time_of_compilation: std::time::SystemTime,
     fs_impl: impl PreprocessorFSAbstraction,
 ) -> Result<bool> {
+    if bytes.starts_with(COMPRESSED_CLANG_OFFLOAD_BUNDLE_MAGIC) {
+        debug!("Found compressed Clang offload bundle in preprocessor output");
+        return Ok(false);
+    }
+
     let mut start = 0;
     let mut hash_start = 0;
     let total_len = bytes.len();
@@ -1271,6 +1298,14 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         self.is_locally_preprocessed
     }
 
+    fn cached_stdout(&self, stdout: Vec<u8>) -> Vec<u8> {
+        if !self.is_locally_preprocessed {
+            return stdout;
+        }
+        self.compiler
+            .cached_stdout(&self.parsed_args, stdout, &self.preprocessor_stderr)
+    }
+
     fn outputs<'a>(&'a self) -> Box<dyn Iterator<Item = FileObjectSource> + 'a> {
         Box::new(
             self.parsed_args
@@ -1478,6 +1513,18 @@ impl pkg::ToolchainPackager for CToolchainPackager {
     }
 }
 
+/// The file name of `input` to put in the hash key, if any.
+///
+/// The inputs of nvcc's device-code steps are its own temporaries, named after
+/// the source, and identical device code from different sources is meant to be
+/// shared.
+fn hashed_input_file_name(language: Language, input: &Path) -> Option<&OsStr> {
+    match language {
+        Language::CudaFE | Language::Ptx | Language::Cubin => None,
+        _ => input.file_name(),
+    }
+}
+
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
 /// Version 14 also invalidates entries from the pre-fix Tasking path.
 pub const CACHE_VERSION: &[u8] = b"14";
@@ -1592,6 +1639,7 @@ pub struct HashKeyParams<'a> {
     plusplus: bool,
     basedirs: &'a [Vec<u8>],
     assembler_digest: Option<&'a str>,
+    input_file_name: Option<&'a OsStr>,
 }
 
 impl<'a> HashKeyParams<'a> {
@@ -1620,6 +1668,7 @@ impl<'a> HashKeyParams<'a> {
             plusplus: false,
             basedirs: &[],
             assembler_digest: None,
+            input_file_name: None,
         }
     }
 
@@ -1653,6 +1702,12 @@ impl<'a> HashKeyParams<'a> {
         self
     }
 
+    /// Sets the file name, without its directory, of the source being compiled.
+    pub fn with_input_file_name(mut self, input_file_name: Option<&'a OsStr>) -> Self {
+        self.input_file_name = input_file_name;
+        self
+    }
+
     /// Computes the hash key based on the configured parameters.
     ///
     /// If `basedirs` are provided, paths in the preprocessor output will be normalized by
@@ -1675,6 +1730,15 @@ impl<'a> HashKeyParams<'a> {
         }
         if let Some(assembler_digest) = self.assembler_digest {
             m.update(assembler_digest.as_bytes());
+        }
+        // The compiler writes the source's file name into the object (the
+        // STT_FILE symbol on ELF), and -P leaves it out of the preprocessed
+        // output, so two sources that preprocess the same would share an
+        // object naming only one of them. The directory is left out: the
+        // symbol does not record it, and keeping it would cost cache hits
+        // across checkouts.
+        if let Some(input_file_name) = self.input_file_name {
+            input_file_name.hash(&mut HashToDigest { digest: &mut m });
         }
 
         for (var, val) in self.env_vars.iter() {
@@ -1735,6 +1799,52 @@ mod test {
             .with_assembler_digest(None)
             .compute();
         assert_eq!(h1, h4);
+    }
+
+    #[test]
+    fn test_input_file_name_differs() {
+        let args = ovec!["a", "b", "c"];
+        let hash_for = |input: &str| {
+            HashKeyParams::new("abcd", Language::C, &args, b"")
+                .with_input_file_name(Path::new(input).file_name())
+                .compute()
+        };
+        assert_neq!(hash_for("alpha.c"), hash_for("beta.c"));
+        assert_eq!(hash_for("alpha.c"), hash_for("src/alpha.c"));
+        assert_eq!(hash_for("/a/alpha.c"), hash_for("/b/alpha.c"));
+    }
+
+    #[test]
+    fn test_device_code_input_file_name_ignored() {
+        let args = ovec!["a", "b", "c"];
+        let hash_for = |language: Language, input: &str| {
+            HashKeyParams::new("abcd", language, &args, b"device code")
+                .with_input_file_name(hashed_input_file_name(language, Path::new(input)))
+                .compute()
+        };
+        // nvcc names the inputs of its device-code steps after the source, so
+        // two sources with the same device code must still share these entries.
+        assert_eq!(
+            hash_for(Language::CudaFE, "alpha.cpp1.ii"),
+            hash_for(Language::CudaFE, "beta.cpp1.ii")
+        );
+        assert_eq!(
+            hash_for(Language::Ptx, "alpha.cpp1.ii"),
+            hash_for(Language::Ptx, "beta.cpp1.ii")
+        );
+        assert_eq!(
+            hash_for(Language::Cubin, "alpha.ptx"),
+            hash_for(Language::Cubin, "beta.ptx")
+        );
+        // Everything else keeps the file name in the key.
+        assert_neq!(
+            hash_for(Language::C, "alpha.c"),
+            hash_for(Language::C, "beta.c")
+        );
+        assert_neq!(
+            hash_for(Language::Cuda, "alpha.cu"),
+            hash_for(Language::Cuda, "beta.cu")
+        );
     }
 
     #[test]
@@ -2122,6 +2232,33 @@ mod test {
         assert_eq!(&bytes, &original_bytes);
         assert!(success);
         assert_eq!(include_files.len(), 0);
+    }
+
+    #[test]
+    fn test_process_preprocessed_file_disables_cache_for_compressed_offload_bundle() {
+        let input_file = Path::new("tests/test.hip");
+        let mut bytes = b"CCOB\0\0\0\0\n# 1karg compressed payload".to_vec();
+        let original_bytes = bytes.clone();
+        let mut include_files = HashMap::new();
+
+        let config = PreprocessorCacheModeConfig {
+            use_preprocessor_cache_mode: true,
+            ..Default::default()
+        };
+        let success = process_preprocessed_file(
+            input_file,
+            Path::new(""),
+            &mut bytes,
+            &mut include_files,
+            config,
+            std::time::SystemTime::now(),
+            PanicFs,
+        )
+        .unwrap();
+
+        assert_eq!(bytes, original_bytes);
+        assert!(!success);
+        assert!(include_files.is_empty());
     }
 
     #[test]

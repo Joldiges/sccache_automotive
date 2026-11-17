@@ -19,7 +19,7 @@ use crate::compiler::{
     SingleCompileCommand, clang, gcc, write_temp_file,
 };
 use crate::mock_command::{CommandCreatorSync, RunCommand};
-use crate::util::{OsStrExt, encode_path, run_input_output};
+use crate::util::{OsStrExt, encode_path, env_var_name_matches, run_input_output};
 use crate::{counted_array, dist};
 use async_trait::async_trait;
 use fs::File;
@@ -103,6 +103,21 @@ impl CCompilerImpl for Msvc {
             self.is_clang,
         )
         .await
+    }
+
+    fn cached_stdout(
+        &self,
+        parsed_args: &ParsedArguments,
+        stdout: Vec<u8>,
+        preprocessor_stderr: &[u8],
+    ) -> Vec<u8> {
+        if !parsed_args.msvc_show_includes {
+            return stdout;
+        }
+        // Include paths are not part of the cache key, so the entry may come
+        // from a compile in another directory. Report the includes that this
+        // compile's own preprocessor run found instead of the stored ones.
+        replace_show_includes(&stdout, preprocessor_stderr, &self.includes_prefix)
     }
 
     fn generate_compile_commands<T>(
@@ -262,6 +277,33 @@ where
     );
 
     bail!("Failed to detect showIncludes prefix")
+}
+
+fn replace_show_includes(
+    stdout: &[u8],
+    preprocessor_stderr: &[u8],
+    includes_prefix: &str,
+) -> Vec<u8> {
+    let is_include =
+        |line: &[u8]| from_local_codepage(line).is_ok_and(|line| line.starts_with(includes_prefix));
+
+    let current_includes = preprocessor_stderr
+        .split_inclusive(|&b| b == b'\n')
+        .filter(|line| is_include(line));
+
+    let mut lines = stdout.split_inclusive(|&b| b == b'\n').collect::<Vec<_>>();
+    // cl.exe echoes the source file name before the includes, both when
+    // compiling and when preprocessing. clang-cl does not.
+    let position = lines
+        .iter()
+        .position(|line| is_include(line))
+        .unwrap_or_else(|| {
+            let first_stderr_line = preprocessor_stderr.split_inclusive(|&b| b == b'\n').next();
+            usize::from(!lines.is_empty() && lines.first() == first_stderr_line.as_ref())
+        });
+    lines.retain(|line| !is_include(line));
+    lines.splice(position..position, current_includes);
+    lines.concat()
 }
 
 ArgData! {
@@ -576,17 +618,6 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
 
 // TODO: what to do with precompiled header flags? eg: /Yc, /YI, /Yu
 
-fn cl_env_var_matches(key: &OsStr, name: &str) -> bool {
-    #[cfg(windows)]
-    {
-        key.eq_ignore_ascii_case(name)
-    }
-    #[cfg(not(windows))]
-    {
-        key == name
-    }
-}
-
 /// Options from `CL` are prepended and options from `_CL_` are appended.
 /// The first `#` in each token stands for `=`.
 fn cl_env_args(
@@ -595,7 +626,7 @@ fn cl_env_args(
 ) -> std::result::Result<Vec<OsString>, &'static str> {
     let Some((_, value)) = env_vars
         .iter()
-        .find(|(key, _)| cl_env_var_matches(key, name))
+        .find(|(key, _)| env_var_name_matches(key, name))
     else {
         return Ok(Vec::new());
     };
@@ -614,7 +645,7 @@ fn cl_env_args(
 }
 
 fn is_cl_env_var(key: &OsStr) -> bool {
-    cl_env_var_matches(key, "CL") || cl_env_var_matches(key, "_CL_")
+    env_var_name_matches(key, "CL") || env_var_name_matches(key, "_CL_")
 }
 
 /// `cl` applies `CL` and `_CL_` itself, so drop them after they have been
@@ -1004,6 +1035,13 @@ pub fn parse_arguments(
     if debug_info && !is_clang {
         match pdb {
             Some(p) => {
+                // A trailing separator makes cl.exe write a shared vc<NNN>.pdb
+                // inside that directory, like the -Fd-less case below, so the
+                // program database cannot be tracked as a per-compilation
+                // artifact.
+                if p.as_os_str().to_string_lossy().ends_with(['\\', '/']) {
+                    cannot_cache!("shared pdb");
+                }
                 // Append the default .pdb prefix if none was given, like how MSVC does.
                 let path = if p.extension().is_none() {
                     let mut path = p;
@@ -1459,13 +1497,28 @@ impl Iterator for ExpandIncludeFile<'_> {
     }
 }
 
-/// Reads the text stream as a unicode buffer, prioritizing UTF-8, UTF-16 (big and little endian), and falling back on ISO 8859-1.
+#[cfg(windows)]
+fn decode_with_codepage(codepage: u32, buf: &[u8]) -> io::Result<String> {
+    use windows_sys::Win32::Globalization::MB_ERR_INVALID_CHARS;
+
+    let wide = crate::util::multi_byte_to_wide_char(codepage, MB_ERR_INVALID_CHARS, buf)?;
+    String::from_utf16(&wide).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Reads text with a UTF-8 or UTF-16 BOM; without a BOM, uses the Windows ANSI code page
+/// (GetACP) on Windows and Windows-1252 on other platforms.
 fn read_text<R>(reader: &mut R) -> io::Result<String>
 where
     R: Read,
 {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
+
+    // Without a BOM, cl.exe reads response files in the system ANSI code page.
+    #[cfg(windows)]
+    if encoding_rs::Encoding::for_bom(&buf).is_none() {
+        return decode_with_codepage(windows_sys::Win32::Globalization::CP_ACP, &buf);
+    }
 
     let (result, _, has_error) = encoding_rs::WINDOWS_1252.decode(&buf);
 
@@ -1641,6 +1694,27 @@ mod test {
             detect_showincludes_prefix(&creator, "cl.exe".as_ref(), false, Vec::new(), &pool)
                 .wait()
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_replace_show_includes() {
+        let stdout = b"foo.c\r\nNote: including file: C:\\a\\inc\\h.h\r\nwarning text\r\n";
+        let preprocessor_stderr = b"foo.c\r\nNote: including file: C:\\b\\inc\\h.h\r\n";
+        let includes_prefix = "Note: including file: ";
+        assert_eq!(
+            replace_show_includes(stdout, preprocessor_stderr, includes_prefix),
+            b"foo.c\r\nNote: including file: C:\\b\\inc\\h.h\r\nwarning text\r\n".to_vec()
+        );
+        let stdout = b"foo.c\r\nwarning text\r\n";
+        assert_eq!(
+            replace_show_includes(stdout, preprocessor_stderr, includes_prefix),
+            b"foo.c\r\nNote: including file: C:\\b\\inc\\h.h\r\nwarning text\r\n".to_vec()
+        );
+        let preprocessor_stderr = b"Note: including file: .\\h.h\n";
+        assert_eq!(
+            replace_show_includes(b"", preprocessor_stderr, includes_prefix),
+            preprocessor_stderr.to_vec()
         );
     }
 
@@ -3356,6 +3430,24 @@ mod test {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn test_responsefile_decode_with_codepage_932() {
+        // `-ID:\tmp\depbug\日本語` encoded as Shift-JIS (code page 932), no BOM
+        let content = b"-ID:\\tmp\\depbug\\\x93\xfa\x96\x7b\x8c\xea";
+        assert_eq!(
+            decode_with_codepage(932, content).unwrap(),
+            r"-ID:\tmp\depbug\日本語"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_responsefile_decode_with_codepage_932_invalid_sequence() {
+        assert!(decode_with_codepage(932, b"\x82").is_err());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
     fn test_responsefile_encoding_win1252() {
         let td = tempfile::Builder::new()
             .prefix("sccache")
@@ -3404,6 +3496,15 @@ mod test {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn test_responsefile_encoding_win1252_windows() {
+        assert_eq!(
+            decode_with_codepage(1252, b"-c foo\x80.c -o foo.o").unwrap(),
+            "-c foo€.c -o foo.o"
+        );
+    }
+
+    #[test]
     fn test_parse_arguments_missing_pdb() {
         assert_eq!(
             CompilerArguments::CannotCache("shared pdb", None),
@@ -3417,6 +3518,36 @@ mod test {
             CompilerArguments::CannotCache("shared pdb", None),
             parse_arguments(ovec!["-c", "foo.c", "-ZI", "-Fofoo.obj"])
         );
+    }
+
+    #[test]
+    fn test_parse_arguments_pdb_directory() {
+        // A trailing separator makes cl.exe write a shared vc<NNN>.pdb in that
+        // directory, which cannot be cached as part of this compilation.
+        for args in [
+            ovec!["-c", "foo.c", "-Zi", "-Fdpdb\\", "-Fofoo.obj"],
+            ovec!["-c", "foo.c", "-Zi", "-Fdpdb/", "-Fofoo.obj"],
+        ] {
+            assert_eq!(
+                CompilerArguments::CannotCache("shared pdb", None),
+                parse_arguments(args)
+            );
+        }
+
+        // Without debug information cl.exe ignores -Fd entirely.
+        let a = match parse_arguments(ovec!["-c", "foo.c", "-Fdpdb\\", "-Fofoo.obj"]) {
+            CompilerArguments::Ok(a) => a,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(!a.outputs.contains_key("pdb"));
+
+        // An explicit file name is a per-compilation artifact and can be cached.
+        let a = match parse_arguments(ovec!["-c", "foo.c", "-Zi", "-Fdpdb\\foo.pdb", "-Fofoo.obj"])
+        {
+            CompilerArguments::Ok(a) => a,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert_eq!(Path::new("pdb\\foo.pdb"), a.outputs["pdb"].path);
     }
 
     #[test]

@@ -38,7 +38,6 @@ use fs_err as fs;
 use futures::channel::mpsc;
 use futures::future::FutureExt;
 use futures::{Sink, SinkExt, Stream, StreamExt, TryFutureExt, future};
-use number_prefix::NumberPrefix;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -71,6 +70,7 @@ use tokio::{
 use tokio_serde::Framed;
 use tokio_util::codec::{LengthDelimitedCodec, length_delimited};
 use tower_service::Service;
+use unit_prefix::NumberPrefix;
 
 use crate::errors::*;
 
@@ -93,6 +93,72 @@ pub enum ServerStartup {
     TimedOut,
     /// Server encountered an error.
     Err { reason: String },
+}
+
+#[cfg(unix)]
+fn bind_unix_listener(path: &std::path::Path) -> io::Result<tokio::net::UnixListener> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::net::UnixStream;
+
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        // Never follow a symlink planted at the lock path, so that the chmod
+        // below cannot be tricked into applying to the link's target.
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(lock_path)?;
+    let mut permissions = lock.metadata()?.permissions();
+    permissions.set_mode(0o600);
+    lock.set_permissions(permissions)?;
+
+    // Keep the lock inode so that it also serializes startup after a crash.
+    lock.lock()?;
+
+    // The lock file was just opened and chmod'ed by us, so its owner is the
+    // user allowed to clean up a stale socket below.
+    let lock_uid = lock.metadata()?.uid();
+
+    match UnixStream::connect(path) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "unix socket is already in use",
+            ));
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_socket() && metadata.uid() == lock_uid => {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(_) => {
+                    return Err(io::Error::other(format!(
+                        "unix socket path {} is not a stale socket",
+                        path.display()
+                    )));
+                }
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                Err(_) => {}
+            }
+        }
+        Err(error) => return Err(error),
+    }
+
+    tokio::net::UnixListener::bind(path)
 }
 
 /// Get the time the server should idle for before shutting down, in seconds.
@@ -493,8 +559,8 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
         _ => raw_storage,
     };
 
-    let res: io::Result<(crate::net::SocketAddr, Box<dyn FnOnce(_) -> io::Result<()>>)> = (|| {
-        match addr {
+    let res: io::Result<(crate::net::SocketAddr, Box<dyn FnOnce(_) -> io::Result<()>>)> =
+        (|| match addr {
             crate::net::SocketAddr::Net(addr) => {
                 trace!("binding TCP {addr}");
                 let l = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
@@ -514,11 +580,9 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
             #[cfg(unix)]
             crate::net::SocketAddr::Unix(path) => {
                 trace!("binding unix socket {}", path.display());
-                // Unix socket will report addr in use on any unlink file.
-                let _ = std::fs::remove_file(path);
                 let l = {
                     let _guard = runtime.enter();
-                    tokio::net::UnixListener::bind(path)?
+                    bind_unix_listener(path)?
                 };
                 let srv = SccacheServer::<_>::with_listener(
                     l,
@@ -557,8 +621,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
                 ))
             }
-        }
-    })();
+        })();
     match res {
         Ok((addr, run)) => {
             info!("server started, listening on {addr}");
@@ -1709,19 +1772,13 @@ where
                                 // Make sure the write guard has been dropped ASAP.
                                 drop(stats);
 
-                                use std::fmt::Write;
-
                                 error!("[{:?}] fatal error: {}", out_pretty, err);
-
-                                let mut error = "sccache: encountered fatal error\n".to_string();
-                                let _ = writeln!(error, "sccache: error: {}", err);
-                                for e in err.chain() {
+                                for e in err.chain().skip(1) {
                                     error!("[{:?}] \t{}", out_pretty, e);
-                                    let _ = writeln!(error, "sccache: caused by: {}", e);
                                 }
                                 //TODO: figure out a better way to communicate this?
                                 res.retcode = Some(-2);
-                                res.stderr = error.into_bytes();
+                                res.stderr = fatal_error_message(&err).into_bytes();
                             }
                         },
                     }
@@ -2557,6 +2614,17 @@ fn waits_until_zero() {
     assert_eq!(wait.now_or_never(), Some(()));
 }
 
+fn fatal_error_message(err: &anyhow::Error) -> String {
+    use std::fmt::Write;
+
+    let mut message = "sccache: encountered fatal error\n".to_string();
+    let _ = writeln!(message, "sccache: error: {}", err);
+    for e in err.chain().skip(1) {
+        let _ = writeln!(message, "sccache: caused by: {}", e);
+    }
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2583,6 +2651,103 @@ mod tests {
         fn write(&mut self, text: &str) {
             self.buffer.push_str(&format!("{}\n", text));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_binding_preserves_live_listener() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("server.sock");
+        let lock_path = tempdir.path().join("server.sock.lock");
+        let runtime = Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let _live = tokio::net::UnixListener::bind(&path).unwrap();
+
+        let error = match bind_unix_listener(&path) {
+            Ok(_) => panic!("a live Unix listener must not be replaced"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+        assert_eq!(
+            std::fs::metadata(lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    // A socket that was bound but never listened refuses connections like one
+    // left behind by a dead server. Dropping a real listener isn't enough on
+    // macOS: there is no SOCK_CLOEXEC, so a process spawned concurrently by
+    // another test can inherit the fd and keep the socket accepting.
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_binding_replaces_stale_socket() {
+        use socket2::{Domain, SockAddr, Socket, Type};
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("server.sock");
+        let runtime = Runtime::new().unwrap();
+        let _guard = runtime.enter();
+
+        let stale = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        stale.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+        drop(stale);
+
+        let replacement = bind_unix_listener(&path).unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+        drop(replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_binding_keeps_regular_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("server.sock");
+        std::fs::write(&path, b"not a socket").unwrap();
+
+        assert!(
+            bind_unix_listener(&path).is_err(),
+            "a regular file at the socket path must not be replaced"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_binding_serializes_concurrent_startup() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = Arc::new(tempdir.path().join("server.sock"));
+
+        let spawn = |p: Arc<std::path::PathBuf>| {
+            thread::spawn(move || {
+                let runtime = Runtime::new().unwrap();
+                let _guard = runtime.enter();
+                bind_unix_listener(&p)
+            })
+        };
+        let first = spawn(Arc::clone(&path));
+        let second = spawn(Arc::clone(&path));
+
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+
+        let listeners = [&first, &second].iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            listeners, 1,
+            "exactly one call may end up with the listener"
+        );
+        let error = first
+            .as_ref()
+            .err()
+            .or_else(|| second.as_ref().err())
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(std::os::unix::net::UnixStream::connect(&*path).is_ok());
     }
 
     #[test]
@@ -2952,5 +3117,16 @@ mod tests {
             "stderr delivered with CompileFinished"
         );
         assert_eq!(0, service.creator.lock().unwrap().children.len());
+    }
+
+    #[test]
+    fn test_fatal_error_message_does_not_repeat_the_error() {
+        let err = anyhow::anyhow!("inner").context("outer");
+        assert_eq!(
+            fatal_error_message(&err),
+            "sccache: encountered fatal error\n\
+             sccache: error: outer\n\
+             sccache: caused by: inner\n"
+        );
     }
 }

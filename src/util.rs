@@ -19,9 +19,11 @@ use fs::File;
 use fs_err as fs;
 use object::read::archive::ArchiveFile;
 use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
+use object::{Object as _, ObjectSection as _};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::env::consts::DLL_EXTENSION;
 use std::ffi::{OsStr, OsString};
 use std::hash::Hasher;
 use std::io::prelude::*;
@@ -38,6 +40,31 @@ pub const BASE64_URL_SAFE_ENGINE: base64::engine::GeneralPurpose =
     base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 pub const HASH_BUFFER_SIZE: usize = 128 * 1024;
+
+/// Reads `reader` to the end, passing each chunk read to `f`.
+///
+/// Goes through `std::io::copy`, whose buffer lives on the stack and is not
+/// zeroed for readers that can fill uninitialized memory, such as files and
+/// byte slices. Zeroing a buffer for each input costs more than hashing a
+/// typical header, which is what direct mode hashes the most, and keeping one
+/// around between calls keeps that memory allocated.
+fn read_chunks<R: Read + ?Sized>(reader: &mut R, f: impl FnMut(&[u8])) -> Result<()> {
+    struct Chunks<F>(F);
+
+    impl<F: FnMut(&[u8])> Write for Chunks<F> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            (self.0)(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    std::io::copy(reader, &mut Chunks(f))?;
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct Digest {
@@ -69,17 +96,10 @@ impl Digest {
     /// `each` before each time the digest is updated.
     pub fn reader_sync_with<R: Read, F: FnMut(&[u8])>(mut reader: R, mut each: F) -> Result<Self> {
         let mut m = Digest::default();
-        // A buffer of 128KB should give us the best performance.
-        // See https://eklitzke.org/efficient-file-copying-on-linux.
-        let mut buffer = [0; HASH_BUFFER_SIZE];
-        loop {
-            let count = reader.read(&mut buffer[..])?;
-            if count == 0 {
-                break;
-            }
-            each(&buffer[..count]);
-            m.update(&buffer[..count]);
-        }
+        read_chunks(&mut reader, |chunk| {
+            each(chunk);
+            m.update(chunk);
+        })?;
         Ok(m)
     }
 
@@ -124,15 +144,7 @@ impl Digest {
     fn update_from_file(&mut self, path: &Path) -> Result<()> {
         let mut file = File::open(path)
             .with_context(|| format!("Failed to open file for hashing: {path:?}"))?;
-        let mut buf = [0u8; HASH_BUFFER_SIZE];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            self.update(&buf[..n]);
-        }
-        Ok(())
+        read_chunks(&mut file, |chunk| self.update(chunk))
     }
 
     /// Recursively collect all file paths within a directory.
@@ -348,6 +360,15 @@ impl TimeMacroFinder {
     pub fn new() -> Self {
         Default::default()
     }
+
+    /// A finder for a file already known to contain the given macros.
+    pub fn with_found(date: bool, time: bool, timestamp: bool) -> Self {
+        let finder = Self::new();
+        finder.found_date.set(date);
+        finder.found_time.set(time);
+        finder.found_timestamp.set(timestamp);
+        finder
+    }
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -443,6 +464,42 @@ pub async fn hash_all_archives(
         fmt_duration_as_secs(&start.elapsed())
     );
     Ok(hashes.into_iter().map(|res| res.unwrap()).collect())
+}
+
+/// Calculate the digest of each `--extern` input in `files`. A dylib, which is how a proc-macro
+/// is built, is hashed by its `.rustc` metadata alone, since on macOS the rest embeds its path.
+pub async fn hash_all_externs(
+    files: &[PathBuf],
+    pool: &tokio::runtime::Handle,
+) -> Result<Vec<String>> {
+    let start = time::Instant::now();
+    let count = files.len();
+    let iter = files.iter().map(|path| async move {
+        if path.extension() != Some(OsStr::new(DLL_EXTENSION)) {
+            return Digest::file(path, pool).await;
+        }
+        let library = path.clone();
+        pool.spawn_blocking(move || -> Result<String> {
+            let data = fs::read(&library)?;
+            let mut m = Digest::new();
+            m.update(rustc_metadata_section(&data).unwrap_or(&data));
+            Ok(m.finish())
+        })
+        .await?
+    });
+    let hashes = futures::future::try_join_all(iter).await?;
+    trace!(
+        "Hashed {} externs in {}",
+        count,
+        fmt_duration_as_secs(&start.elapsed())
+    );
+    Ok(hashes)
+}
+
+fn rustc_metadata_section(data: &[u8]) -> Option<&[u8]> {
+    let file = object::File::parse(data).ok()?;
+    let section = file.section_by_name(".rustc")?;
+    section.data().ok().filter(|bytes| !bytes.is_empty())
 }
 
 fn hash_regular_archive(m: &mut Digest, data: &[u8]) -> Result<()> {
@@ -592,6 +649,23 @@ where
                 Err(ProcessError(output).into())
             }
         })
+}
+
+/// The `ExitStatus` of a process that exited with `code`.
+///
+/// On Unix `ExitStatus::from_raw` takes a wait status, not an exit code: given an exit code
+/// directly, -2 reads as "killed by signal 126" and 1 as signal 1.
+#[cfg(unix)]
+pub fn exit_status_from_code(code: i32) -> process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    process::ExitStatus::from_raw((code & 0xff) << 8)
+}
+
+/// The `ExitStatus` of a process that exited with `code`.
+#[cfg(windows)]
+pub fn exit_status_from_code(code: i32) -> process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    process::ExitStatus::from_raw(code as u32)
 }
 
 /// Write `data` to `writer` with bincode serialization, prefixed by a `u32` length.
@@ -1469,6 +1543,18 @@ fn double_path_separators(path: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Environment variable names are case-insensitive on Windows.
+pub fn env_var_name_matches(key: &OsStr, name: &str) -> bool {
+    #[cfg(windows)]
+    {
+        key.eq_ignore_ascii_case(name)
+    }
+    #[cfg(not(windows))]
+    {
+        key == name
+    }
+}
+
 /// Normalize path for case-insensitive comparison.
 /// On Windows: converts all backslashes to forward slashes;
 ///             lowercases characters for consistency.
@@ -1614,9 +1700,154 @@ pub fn resolve_compiler_avoiding_wrapper(
 
 #[cfg(test)]
 mod tests {
-    use super::{Digest, OsStrExt, TimeMacroFinder, resolve_compiler_avoiding_wrapper};
+    use super::{
+        Digest, OsStrExt, TimeMacroFinder, exit_status_from_code, hash_all_archives,
+        hash_all_externs, resolve_compiler_avoiding_wrapper,
+    };
+    use crate::test::utils::single_threaded_runtime;
+    use object::write::Object as WriteObject;
+    use object::{Architecture, BinaryFormat, Endianness, SectionKind};
+    use std::env::consts::DLL_EXTENSION;
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
+
+    fn object_with(metadata: &[u8], code: &[u8]) -> Vec<u8> {
+        let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let text = obj.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+        obj.append_section_data(text, code, 1);
+        let rustc = obj.add_section(Vec::new(), b".rustc".to_vec(), SectionKind::Data);
+        obj.append_section_data(rustc, metadata, 1);
+        obj.write().unwrap()
+    }
+
+    // Dist JWT secrets and PKCE values are stored or sent in this form, so the
+    // alphabet and lack of padding must not change.
+    #[test]
+    fn test_base64_url_safe_engine_output() {
+        use base64::Engine;
+        let engine = super::BASE64_URL_SAFE_ENGINE;
+        assert_eq!(engine.encode([0xfb, 0xff]), "-_8");
+        assert_eq!(engine.decode("-_8").unwrap(), [0xfb, 0xff]);
+        assert!(engine.decode("-_8=").is_err());
+    }
+
+    #[test]
+    fn test_hash_all_externs_hashes_a_dylib_by_its_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, bytes: Vec<u8>| {
+            let path = dir.path().join(format!("{name}.{DLL_EXTENSION}"));
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let files = [
+            write("a", object_with(b"meta", b"code")),
+            write("b", object_with(b"meta", b"other code, longer")),
+            write("c", object_with(b"changed", b"code")),
+        ];
+
+        let runtime = single_threaded_runtime();
+        let hashes = runtime
+            .block_on(hash_all_externs(&files, runtime.handle()))
+            .unwrap();
+        assert_eq!(hashes[0], hashes[1]);
+        assert_ne!(hashes[0], hashes[2]);
+    }
+
+    fn coff_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut archive = b"!<arch>\n".to_vec();
+        for (name, data) in members {
+            let mut header = [b' '; 60];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            let size = data.len().to_string();
+            header[48..48 + size.len()].copy_from_slice(size.as_bytes());
+            header[58..].copy_from_slice(b"`\n");
+            archive.extend_from_slice(&header);
+            archive.extend_from_slice(data);
+            if data.len() % 2 != 0 {
+                archive.push(b'\n');
+            }
+        }
+        archive
+    }
+
+    #[test]
+    fn test_hash_all_archives_skips_ec_symbol_table() {
+        // llvm-ar omits the `//` names table when every member name fits in
+        // the header; object < 0.40 then returned `/<ECSYMBOLS>/` as a member.
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, ec_symbols: &[u8], code: &[u8]| {
+            let path = dir.path().join(name);
+            let archive = coff_archive(&[
+                ("/", &[0; 4]),
+                ("/", &[0; 4]),
+                ("/<ECSYMBOLS>/", ec_symbols),
+                ("foo.obj/", code),
+            ]);
+            std::fs::write(&path, archive).unwrap();
+            path
+        };
+        let files = [
+            write("a.lib", &[1, 0, 1, 0], b"code"),
+            write("b.lib", &[2, 0, 2, 0], b"code"),
+            write("c.lib", &[1, 0, 1, 0], b"changed"),
+        ];
+
+        let runtime = single_threaded_runtime();
+        let hashes = runtime
+            .block_on(hash_all_archives(&files, runtime.handle()))
+            .unwrap();
+        assert_eq!(hashes[0], hashes[1]);
+        assert_ne!(hashes[0], hashes[2]);
+    }
+
+    #[test]
+    fn test_reader_sync_across_buffer_sizes() {
+        use super::HASH_BUFFER_SIZE;
+        // `std::io::copy` reads 8KB at a time (std's `DEFAULT_BUF_SIZE`):
+        // sizes around the end of the first and second chunks, and around
+        // `HASH_BUFFER_SIZE`, the chunk size used before.
+        const COPY_CHUNK: usize = 8 * 1024;
+        let boundaries = [COPY_CHUNK, 2 * COPY_CHUNK, HASH_BUFFER_SIZE];
+        for boundary in boundaries {
+            for len in [boundary - 1, boundary, boundary + 1] {
+                let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                let mut expected = Digest::new();
+                expected.update(&data);
+                let expected = expected.finish();
+                assert_eq!(Digest::reader_sync(data.as_slice()).unwrap(), expected);
+            }
+            // A time macro split by the chunk boundary is still found.
+            let mut data = vec![0u8; boundary + HASH_BUFFER_SIZE];
+            let start = boundary - b"__TIME__".len() / 2;
+            data[start..][..b"__TIME__".len()].copy_from_slice(b"__TIME__");
+            let finder = Digest::reader_sync_time_macros(data.as_slice()).unwrap().1;
+            assert!(finder.found_time());
+        }
+    }
+
+    #[test]
+    fn test_exit_status_from_code() {
+        assert!(exit_status_from_code(0).success());
+        assert_eq!(exit_status_from_code(1).code(), Some(1));
+        assert_eq!(exit_status_from_code(255).code(), Some(255));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exit_status_from_code_is_not_a_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        for code in [1, 2, 126, 127, 255, -2] {
+            let status = exit_status_from_code(code);
+            assert_eq!(status.signal(), None, "exit code {code}");
+            assert_eq!(status.code(), Some(code & 0xff), "exit code {code}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_exit_status_from_code_keeps_the_code() {
+        assert_eq!(exit_status_from_code(-2).code(), Some(-2));
+    }
 
     #[cfg(all(any_dist, target_os = "linux"))]
     #[test]
@@ -1635,6 +1866,26 @@ mod tests {
                 super::new_reqwest_blocking_client().map(drop)
             },
         )
+    }
+
+    #[test]
+    fn test_hash_all_externs_hashes_whole_files_without_rustc_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let rlib = dir.path().join("libfoo.rlib");
+        let not_an_object = dir.path().join(format!("libbar.{DLL_EXTENSION}"));
+        let missing = dir.path().join(format!("libmissing.{DLL_EXTENSION}"));
+        std::fs::write(&rlib, b"an rlib").unwrap();
+        std::fs::write(&not_an_object, b"not an object file").unwrap();
+
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle();
+        let whole = |path| runtime.block_on(Digest::file(path, pool)).unwrap();
+        let files = [rlib.clone(), not_an_object.clone()];
+        let hashes = runtime.block_on(hash_all_externs(&files, pool)).unwrap();
+        assert_eq!(hashes, vec![whole(&rlib), whole(&not_an_object)]);
+
+        let missing_result = runtime.block_on(hash_all_externs(&[missing], pool));
+        assert!(missing_result.is_err());
     }
 
     #[test]

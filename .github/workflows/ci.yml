@@ -183,6 +183,13 @@ jobs:
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             TARGET="x86_64-pc-windows-msvc"
             EXT="zip"
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            case "$RUNNER_ARCH" in
+              ARM64) TARGET="aarch64-apple-darwin" ;;
+              X64) TARGET="x86_64-apple-darwin" ;;
+              *) echo "Unsupported macOS runner architecture: $RUNNER_ARCH" >&2; exit 1 ;;
+            esac
+            EXT="tar.bz2"
           else
             TARGET="x86_64-unknown-linux-musl"
             EXT="tar.bz2"

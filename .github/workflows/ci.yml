@@ -107,9 +107,6 @@ jobs:
             # Oldest supported version, keep in sync with README.md
             rustc: "1.91.0"
             extra_desc: cuda12.8
-          # # M1 CPU
-          - os: macos-15
-          - os: macos-15-intel
           - os: windows-2022
             cuda: "12.8"
             # Oldest supported version, keep in sync with README.md
@@ -183,21 +180,12 @@ jobs:
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             TARGET="x86_64-pc-windows-msvc"
             EXT="zip"
-          elif [[ "$RUNNER_OS" == "macOS" ]]; then
-            case "$RUNNER_ARCH" in
-              ARM64) TARGET="aarch64-apple-darwin" ;;
-              X64) TARGET="x86_64-apple-darwin" ;;
-              *) echo "Unsupported macOS runner architecture: $RUNNER_ARCH" >&2; exit 1 ;;
-            esac
-            EXT="tar.bz2"
           else
             TARGET="x86_64-unknown-linux-musl"
             EXT="tar.bz2"
           fi
           URL="https://github.com/mozilla/grcov/releases/download/v${GRCOV_VERSION}/grcov-${TARGET}.${EXT}"
           curl -fsSL "$URL" -o "grcov.${EXT}"
-          # The macos-15 images don't install Rust under ~/.cargo, so the
-          # directory may not exist yet; create it and put it on PATH.
           BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
           mkdir -p "$BIN_DIR"
           if [[ "$EXT" == "zip" ]]; then
@@ -307,14 +295,6 @@ jobs:
           - os: ubuntu-22.04
             target: i686-unknown-linux-musl
             container: '{"image": "messense/rust-musl-cross:i686-musl"}'
-          - os: macos-15
-            target: aarch64-apple-darwin
-            macosx_deployment_target: 11.0
-            pgo: true
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            macosx_deployment_target: 11.0
-            pgo: true
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             rustflags: -Ctarget-feature=+crt-static

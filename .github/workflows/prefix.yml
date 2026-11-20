@@ -18,7 +18,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: self-hosted
+          # Keep the Linux package's GLIBC floor compatible with Ubuntu 22.04.  Bring up self-hosted later.
+          - os: ubuntu-22.04
             target: linux-64
           - os: windows-2022
             target: win-64
